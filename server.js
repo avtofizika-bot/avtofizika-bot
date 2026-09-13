@@ -75,6 +75,17 @@ async function askClaude(userId, content) {
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       messages: getHistory(userId),
+      tools: [
+        {
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 3,
+          // Обмежуємо пошук лише сайтом постачальника запчастин —
+          // бот не буде "гуляти" по всьому інтернету, тільки шукати
+          // реальні ціни на конкретні деталі на sklofar.ua.
+          allowed_domains: ["sklofar.ua"],
+        },
+      ],
     }),
   });
 
