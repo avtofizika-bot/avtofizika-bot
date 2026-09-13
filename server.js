@@ -56,9 +56,12 @@ function pushToHistory(userId, role, content) {
 
 // ---------------------------------------------------------------------------
 // Вызов Anthropic API. Общая функция для всех платформ.
+// content может быть либо просто строкой (обычный текст), либо массивом
+// блоков вида [{type:"text", text:"..."}, {type:"image", source:{...}}]
+// — так бот может "видеть" присланные клиентом фото.
 // ---------------------------------------------------------------------------
-async function askClaude(userId, userMessage) {
-  pushToHistory(userId, "user", userMessage);
+async function askClaude(userId, content) {
+  pushToHistory(userId, "user", content);
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -93,6 +96,32 @@ async function askClaude(userId, userMessage) {
 }
 
 // ---------------------------------------------------------------------------
+// Скачивает файл (фото), присланный клиентом в Telegram, и возвращает его
+// в виде base64-строки вместе с media_type — в таком формате Anthropic API
+// принимает изображения.
+// ---------------------------------------------------------------------------
+async function downloadTelegramPhotoAsBase64(fileId) {
+  // Шаг 1: узнаём, где именно лежит файл на серверах Telegram
+  const fileInfoResp = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
+  );
+  const fileInfo = await fileInfoResp.json();
+  const filePath = fileInfo.result.file_path;
+
+  // Шаг 2: скачиваем сам файл
+  const fileResp = await fetch(
+    `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
+  );
+  const arrayBuffer = await fileResp.arrayBuffer();
+  const base64Data = Buffer.from(arrayBuffer).toString("base64");
+
+  // Telegram обычно присылает фото в формате jpeg
+  const mediaType = filePath.endsWith(".png") ? "image/png" : "image/jpeg";
+
+  return { base64Data, mediaType };
+}
+
+// ---------------------------------------------------------------------------
 // Health check — чтобы хостинг (Render/Railway) видел, что сервис жив.
 // ---------------------------------------------------------------------------
 app.get("/", (req, res) => {
@@ -111,12 +140,44 @@ app.post("/webhook/telegram", async (req, res) => {
 
   try {
     const message = req.body.message;
-    if (!message || !message.text) return;
+    if (!message) return;
 
     const chatId = message.chat.id;
-    const userText = message.text;
+    let contentForClaude;
 
-    const replyText = await askClaude(`telegram:${chatId}`, userText);
+    if (message.photo && message.photo.length > 0) {
+      // message.photo — массив размеров одного и того же фото.
+      // Берём последний элемент — это версия с наибольшим разрешением.
+      const largestPhoto = message.photo[message.photo.length - 1];
+      const { base64Data, mediaType } = await downloadTelegramPhotoAsBase64(
+        largestPhoto.file_id
+      );
+
+      contentForClaude = [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mediaType,
+            data: base64Data,
+          },
+        },
+        {
+          type: "text",
+          text:
+            message.caption && message.caption.trim().length > 0
+              ? message.caption
+              : "Клієнт надіслав фото фари без підпису. Подивись на фото і прокоментуй стан фари, запропонуй релевантну послугу.",
+        },
+      ];
+    } else if (message.text) {
+      contentForClaude = message.text;
+    } else {
+      // Другие типы сообщений (стикеры, голосовые и т.д.) пока не обрабатываем
+      return;
+    }
+
+    const replyText = await askClaude(`telegram:${chatId}`, contentForClaude);
 
     await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
