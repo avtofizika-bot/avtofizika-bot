@@ -79,7 +79,7 @@ async function askClaude(userId, content) {
         {
           type: "web_search_20250305",
           name: "web_search",
-          max_uses: 3,
+          max_uses: 5,
           // Обмежуємо пошук лише сайтом постачальника запчастин —
           // бот не буде "гуляти" по всьому інтернету, тільки шукати
           // реальні ціни на конкретні деталі на sklofar.ua.
