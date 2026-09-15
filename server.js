@@ -34,6 +34,13 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 // (не для відповіді клієнту, лише щоб зрозуміти "фари" це чи "детейлінг").
 const CLASSIFIER_MODEL =
   process.env.CLASSIFIER_MODEL || "claude-haiku-4-5-20251001";
+// Адреса webhook у Make.com, куди відправляються заявки для створення
+// ліда в РемОнлайн. Отримати цю адресу — див. README (розділ CRM).
+const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || "";
+
+if (!MAKE_WEBHOOK_URL) {
+  console.warn("ВНИМАНИЕ: переменная MAKE_WEBHOOK_URL не задана. Заявки в CRM отправляться не будут.");
+}
 
 if (!ANTHROPIC_API_KEY) {
   console.warn("ВНИМАНИЕ: переменная ANTHROPIC_API_KEY не задана. Задайте её в .env файле.");
@@ -83,6 +90,12 @@ function pushToHistory(userId, role, content) {
     history.shift();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Множина userId, для яких лід вже був відправлений в CRM — щоб не
+// відправляти повторно на кожне наступне повідомлення того ж клієнта.
+// ---------------------------------------------------------------------------
+const leadAlreadySent = new Set();
 
 // ---------------------------------------------------------------------------
 // Витягає звичайний текст з "content" повідомлення (яке може бути або
@@ -224,6 +237,97 @@ async function askClaude(userId, content) {
 }
 
 // ---------------------------------------------------------------------------
+// Окремим (легким) запитом перевіряє ВСЮ переписку з клієнтом — чи десь у
+// ній він назвав і ім'я, і номер телефону. Це надійніше, ніж просити
+// основну розмовну модель самій додавати службову позначку в кожній
+// відповіді (вона не завжди про це пам'ятає) — тут це окреме, просте і
+// цілеспрямоване завдання для моделі.
+// Повертає {name, phone, topic} або null, якщо контактів ще нема.
+// ---------------------------------------------------------------------------
+async function extractLeadFromConversation(userId) {
+  const history = getHistory(userId);
+  const transcript = history
+    .map((m) => `${m.role}: ${extractPlainText(m.content)}`)
+    .join("\n");
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: CLASSIFIER_MODEL,
+        max_tokens: 200,
+        system:
+          "Ти уважно читаєш переписку клієнта з чат-ботом автосервісу. " +
+          "Твоє єдине завдання: перевірити, чи клієнт десь у переписці назвав " +
+          "І своє ім'я, І номер телефону (обидва одразу, в будь-якому повідомленні). " +
+          "Якщо так — поверни РІВНО такий JSON, нічого більше: " +
+          '{"found":true,"name":"ім\'я клієнта","phone":"номер телефону як написав клієнт","topic":"короткий опис запиту клієнта одним реченням"} ' +
+          "Якщо клієнт НЕ називав одночасно і ім'я, і телефон — поверни РІВНО: " +
+          '{"found":false} ' +
+          "Відповідай лише цим JSON, без жодного іншого тексту, пояснень чи форматування.",
+        messages: [
+          {
+            role: "user",
+            content: `Переписка:\n${transcript}`,
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("Помилка перевірки ліда:", response.status);
+      return null;
+    }
+
+    const data = await response.json();
+    const raw = (data.content[0] && data.content[0].text) || "{}";
+    const parsed = JSON.parse(raw.trim());
+
+    if (parsed.found && parsed.name && parsed.phone) {
+      return {
+        name: parsed.name,
+        phone: parsed.phone,
+        topic: parsed.topic || "",
+      };
+    }
+    return null;
+  } catch (err) {
+    console.error("Помилка перевірки ліда:", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Відправляє дані ліда у Make.com, який далі створює звернення в РемОнлайн.
+// ---------------------------------------------------------------------------
+async function sendLeadToCRM(lead, source) {
+  if (!MAKE_WEBHOOK_URL) {
+    console.warn("MAKE_WEBHOOK_URL не задано, лід не відправлено:", lead);
+    return;
+  }
+  try {
+    await fetch(MAKE_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: lead.name || "",
+        phone: lead.phone || "",
+        topic: lead.topic || "",
+        source, // "telegram" або "website"
+      }),
+    });
+    console.log("Лід відправлено в CRM:", lead.name, lead.phone);
+  } catch (err) {
+    console.error("Помилка відправки ліда в CRM:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Скачивает файл (фото), присланный клиентом в Telegram, и возвращает его
 // в виде base64-строки вместе с media_type — в таком формате Anthropic API
 // принимает изображения.
@@ -305,7 +409,16 @@ app.post("/webhook/telegram", async (req, res) => {
       return;
     }
 
-    const replyText = await askClaude(`telegram:${chatId}`, contentForClaude);
+    const telegramUserId = `telegram:${chatId}`;
+    const replyText = await askClaude(telegramUserId, contentForClaude);
+
+    if (!leadAlreadySent.has(telegramUserId)) {
+      const lead = await extractLeadFromConversation(telegramUserId);
+      if (lead) {
+        leadAlreadySent.add(telegramUserId);
+        sendLeadToCRM(lead, "telegram");
+      }
+    }
 
     await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -336,7 +449,17 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "Нужны поля userId и message" });
     }
 
-    const replyText = await askClaude(`site:${userId}`, message);
+    const siteUserId = `site:${userId}`;
+    const replyText = await askClaude(siteUserId, message);
+
+    if (!leadAlreadySent.has(siteUserId)) {
+      const lead = await extractLeadFromConversation(siteUserId);
+      if (lead) {
+        leadAlreadySent.add(siteUserId);
+        sendLeadToCRM(lead, "website");
+      }
+    }
+
     res.json({ reply: replyText });
   } catch (err) {
     console.error("Ошибка обработки веб-чата:", err);
