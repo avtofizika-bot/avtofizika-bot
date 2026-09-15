@@ -30,18 +30,34 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+// Легка/дешева модель для швидкої класифікації теми повідомлення
+// (не для відповіді клієнту, лише щоб зрозуміти "фари" це чи "детейлінг").
+const CLASSIFIER_MODEL =
+  process.env.CLASSIFIER_MODEL || "claude-haiku-4-5-20251001";
 
 if (!ANTHROPIC_API_KEY) {
   console.warn("ВНИМАНИЕ: переменная ANTHROPIC_API_KEY не задана. Задайте её в .env файле.");
 }
 
 // ---------------------------------------------------------------------------
-// Системный промпт загружается один раз при старте сервера из markdown-файла.
-// Чтобы обновить поведение бота (цены, услуги, тон) — правьте systemPrompt.md
-// и перезапустите сервер. Код трогать не нужно.
+// Базу знань розбито на три файли:
+//  - systemPrompt-common.md    — спільне для обох тем (роль, тон, контакти, правила)
+//  - systemPrompt-fary.md      — все про фари/оптику/світло
+//  - systemPrompt-detailing.md — все про детейлінг/мийку/кузов
+// Сервер сам визначає тему повідомлення клієнта і підвантажує common +
+// потрібний спеціалізований розділ. Щоб відредагувати базу знань — правте
+// відповідний .md файл і перезапустіть сервер. Код трогать не нужно.
 // ---------------------------------------------------------------------------
-const SYSTEM_PROMPT = fs.readFileSync(
-  path.join(__dirname, "systemPrompt.md"),
+const PROMPT_COMMON = fs.readFileSync(
+  path.join(__dirname, "systemPrompt-common.md"),
+  "utf-8"
+);
+const PROMPT_FARY = fs.readFileSync(
+  path.join(__dirname, "systemPrompt-fary.md"),
+  "utf-8"
+);
+const PROMPT_DETAILING = fs.readFileSync(
+  path.join(__dirname, "systemPrompt-detailing.md"),
   "utf-8"
 );
 
@@ -69,13 +85,116 @@ function pushToHistory(userId, role, content) {
 }
 
 // ---------------------------------------------------------------------------
+// Витягає звичайний текст з "content" повідомлення (яке може бути або
+// простим рядком, або масивом блоків текст+зображення) — потрібно для
+// класифікації теми.
+// ---------------------------------------------------------------------------
+function extractPlainText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const textBlock = content.find((b) => b.type === "text");
+    return textBlock ? textBlock.text : "[фото]";
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Визначає тему звернення клієнта: FARY, DETAILING або GENERAL.
+// Використовує легку/дешеву модель окремим (коротким) запитом — це не
+// відповідь клієнту, а лише внутрішня класифікація для вибору бази знань.
+// ---------------------------------------------------------------------------
+async function classifyTopic(userId, latestUserText) {
+  const history = getHistory(userId);
+  const recentContext = history
+    .slice(-6)
+    .map((m) => `${m.role}: ${extractPlainText(m.content)}`)
+    .join("\n");
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: CLASSIFIER_MODEL,
+        max_tokens: 10,
+        system:
+          "Ти класифікатор тем звернень клієнтів автосервісу AvtoFizika. " +
+          "Категорії:\n" +
+          "FARY — все про фари, оптику, світло, скло фар, ліхтарі, полірування фар, Бі-LED, переробку задніх ліхтарів.\n" +
+          "DETAILING — мийка, полірування кузова, хімчистка салону, шумоізоляція, захисна плівка на кузов, тонування, кераміка.\n" +
+          "GENERAL — привітання, контакти, графік роботи, подяка, або якщо неможливо однозначно визначити.\n" +
+          "Відповідай РІВНО ОДНИМ словом великими літерами: FARY, DETAILING або GENERAL. Без пояснень і жодних інших символів.",
+        messages: [
+          {
+            role: "user",
+            content: `Історія розмови:\n${recentContext}\n\nОстаннє повідомлення клієнта: "${latestUserText}"\n\nЯка тема?`,
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("Помилка класифікації теми:", response.status);
+      return "GENERAL";
+    }
+
+    const data = await response.json();
+    const raw = (data.content[0] && data.content[0].text ? data.content[0].text : "")
+      .trim()
+      .toUpperCase();
+
+    if (raw.includes("FARY")) return "FARY";
+    if (raw.includes("DETAILING")) return "DETAILING";
+    return "GENERAL";
+  } catch (err) {
+    console.error("Помилка класифікації теми:", err);
+    return "GENERAL";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Вызов Anthropic API. Общая функция для всех платформ.
 // content может быть либо просто строкой (обычный текст), либо массивом
-// блоков вида [{type:"text", text:"..."}, {type:"image", source:{...}}]
+// блоків вида [{type:"text", text:"..."}, {type:"image", source:{...}}]
 // — так бот может "видеть" присланные клиентом фото.
 // ---------------------------------------------------------------------------
 async function askClaude(userId, content) {
   pushToHistory(userId, "user", content);
+
+  const latestUserText = extractPlainText(content);
+  const topic = await classifyTopic(userId, latestUserText);
+  console.log(`[${userId}] тема повідомлення визначена як: ${topic}`);
+
+  let systemPrompt = PROMPT_COMMON;
+  if (topic === "FARY") {
+    systemPrompt += "\n\n" + PROMPT_FARY;
+  } else if (topic === "DETAILING") {
+    systemPrompt += "\n\n" + PROMPT_DETAILING;
+  }
+
+  const tools =
+    topic === "FARY"
+      ? [
+          {
+            type: "web_search_20250305",
+            name: "web_search",
+            max_uses: 5,
+            allowed_domains: ["sklofar.ua"],
+          },
+        ]
+      : undefined;
+
+  const requestBody = {
+    model: ANTHROPIC_MODEL,
+    max_tokens: 1024,
+    system: systemPrompt,
+    messages: getHistory(userId),
+  };
+  if (tools) requestBody.tools = tools;
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -84,23 +203,7 @@ async function askClaude(userId, content) {
       "x-api-key": ANTHROPIC_API_KEY,
       "anthropic-version": "2023-06-01",
     },
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages: getHistory(userId),
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-          max_uses: 5,
-          // Обмежуємо пошук лише сайтом постачальника запчастин —
-          // бот не буде "гуляти" по всьому інтернету, тільки шукати
-          // реальні ціни на конкретні деталі на sklofar.ua.
-          allowed_domains: ["sklofar.ua"],
-        },
-      ],
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
