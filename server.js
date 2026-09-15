@@ -331,6 +331,11 @@ async function sendLeadToCRM(lead, source) {
   // поле "термін"/"дедлайн".
   const topicWithTimestamp = `[Заявка від ${timestamp}] ${lead.topic || ""}`.trim();
 
+  // ISO-формат (наприклад, 2026-09-15T15:16:00+03:00) — саме такий формат
+  // очікують поля типу "дата/час" у більшості CRM, включно з полем
+  // "Кінцевий термін" у РемОнлайн.
+  const deadlineIso = now.toISOString();
+
   try {
     await fetch(MAKE_WEBHOOK_URL, {
       method: "POST",
@@ -339,9 +344,8 @@ async function sendLeadToCRM(lead, source) {
         name: lead.name || "",
         phone: lead.phone || "",
         topic: topicWithTimestamp,
-        timestamp, // окреме поле — можна додатково прив'язати в Make до
-                   // спеціального поля "термін"/"дедлайн" в РемОнлайн, якщо
-                   // таке поле там є.
+        timestamp, // людський формат — для відображення в тексті
+        deadline: deadlineIso, // ISO-формат — для поля "Кінцевий термін"
         source, // "telegram" або "website"
       }),
     });
