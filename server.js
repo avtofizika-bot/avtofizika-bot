@@ -285,8 +285,11 @@ async function extractLeadFromConversation(userId) {
     }
 
     const data = await response.json();
-    const raw = (data.content[0] && data.content[0].text) || "{}";
-    const parsed = JSON.parse(raw.trim());
+    let raw = (data.content[0] && data.content[0].text) || "{}";
+    // Модель іноді обгортає відповідь в markdown-розмітку (```json ... ```) —
+    // знімаємо цю обгортку перед парсингом, інакше JSON.parse впаде з помилкою.
+    raw = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const parsed = JSON.parse(raw);
 
     if (parsed.found && parsed.name && parsed.phone) {
       return {
