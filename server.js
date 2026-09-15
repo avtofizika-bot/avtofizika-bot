@@ -12,6 +12,20 @@ require("dotenv").config();
 const app = express();
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// CORS — дозволяємо браузеру на вашому сайті (avtofizika.com.ua) звертатися
+// до цього сервера. Без цього браузер заблокує запити від чат-віджета.
+// ---------------------------------------------------------------------------
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
