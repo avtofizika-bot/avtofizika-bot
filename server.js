@@ -189,17 +189,9 @@ async function askClaude(userId, content) {
     systemPrompt += "\n\n" + PROMPT_DETAILING;
   }
 
-  const tools =
-    topic === "FARY"
-      ? [
-          {
-            type: "web_search_20250305",
-            name: "web_search",
-            max_uses: 5,
-            allowed_domains: ["sklofar.ua"],
-          },
-        ]
-      : undefined;
+  // Пошук по sklofar.ua відключено — тепер бот рахує лише вартість робіт,
+  // а вартість запчастин (скло, корпуси тощо) додає менеджер вручну.
+  const tools = undefined;
 
   const requestBody = {
     model: ANTHROPIC_MODEL,
