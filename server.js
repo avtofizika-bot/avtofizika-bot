@@ -488,52 +488,62 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// INSTAGRAM DIRECT (заготовка)
-// Instagram Messaging API через Meta Graph API присылает вебхуки в похожем
-// формате на Messenger. Структура тела запроса отличается от Telegram, но
-// логика та же: достать текст сообщения и id отправителя, вызвать askClaude,
-// отправить ответ через Graph API (POST /me/messages).
-// Раскомментируйте и донастройте после получения доступа к Meta Business API.
+// INSTAGRAM DIRECT
+// Instagram Messaging API через Meta Graph API присилає вебхуки в схожому
+// форматі на Messenger. Логіка та ж сама, що й для Telegram/сайту: дістати
+// текст повідомлення та id відправника, викликати askClaude, перевірити
+// лід, відправити відповідь через Graph API (POST /me/messages).
 // ---------------------------------------------------------------------------
-// app.get("/webhook/instagram", (req, res) => {
-//   // Meta требует верификацию webhook при подключении (hub.challenge)
-//   const VERIFY_TOKEN = process.env.INSTAGRAM_VERIFY_TOKEN;
-//   const mode = req.query["hub.mode"];
-//   const token = req.query["hub.verify_token"];
-//   const challenge = req.query["hub.challenge"];
-//   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-//     res.status(200).send(challenge);
-//   } else {
-//     res.sendStatus(403);
-//   }
-// });
-//
-// app.post("/webhook/instagram", async (req, res) => {
-//   res.sendStatus(200);
-//   try {
-//     const entry = req.body.entry?.[0];
-//     const messaging = entry?.messaging?.[0];
-//     const senderId = messaging?.sender?.id;
-//     const userText = messaging?.message?.text;
-//     if (!senderId || !userText) return;
-//
-//     const replyText = await askClaude(`instagram:${senderId}`, userText);
-//
-//     await fetch(
-//       `https://graph.facebook.com/v19.0/me/messages?access_token=${process.env.INSTAGRAM_PAGE_ACCESS_TOKEN}`,
-//       {
-//         method: "POST",
-//         headers: { "Content-Type": "application/json" },
-//         body: JSON.stringify({
-//           recipient: { id: senderId },
-//           message: { text: replyText },
-//         }),
-//       }
-//     );
-//   } catch (err) {
-//     console.error("Ошибка обработки Instagram сообщения:", err);
-//   }
-// });
+app.get("/webhook/instagram", (req, res) => {
+  // Meta вимагає верифікацію webhook при підключенні (hub.challenge)
+  const VERIFY_TOKEN = process.env.INSTAGRAM_VERIFY_TOKEN;
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
+app.post("/webhook/instagram", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const entry = req.body.entry?.[0];
+    const messaging = entry?.messaging?.[0];
+    const senderId = messaging?.sender?.id;
+    const userText = messaging?.message?.text;
+    // Instagram надсилає окремі "echo"-події на власні відправлені
+    // повідомлення бота — їх ігноруємо, інакше бот буде відповідати сам собі.
+    if (!senderId || !userText || messaging?.message?.is_echo) return;
+
+    const instagramUserId = `instagram:${senderId}`;
+    const replyText = await askClaude(instagramUserId, userText);
+
+    if (!leadAlreadySent.has(instagramUserId)) {
+      const lead = await extractLeadFromConversation(instagramUserId);
+      if (lead) {
+        leadAlreadySent.add(instagramUserId);
+        sendLeadToCRM(lead, "instagram");
+      }
+    }
+
+    await fetch(
+      `https://graph.facebook.com/v19.0/me/messages?access_token=${process.env.INSTAGRAM_PAGE_ACCESS_TOKEN}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: senderId },
+          message: { text: replyText },
+        }),
+      }
+    );
+  } catch (err) {
+    console.error("Ошибка обработки Instagram сообщения:", err);
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`AvtoFizika bot server запущен на порту ${PORT}`);
