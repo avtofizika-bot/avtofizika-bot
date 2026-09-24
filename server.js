@@ -508,6 +508,7 @@ app.get("/webhook/instagram", (req, res) => {
 });
 
 app.post("/webhook/instagram", async (req, res) => {
+  console.log("INSTAGRAM WEBHOOK ПОЛУЧЕНО:", JSON.stringify(req.body));
   res.sendStatus(200);
   try {
     const entry = req.body.entry?.[0];
