@@ -546,6 +546,75 @@ app.post("/webhook/instagram", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// RO APP (RemOnline) API v2 — діагностика перед підключенням онлайн-запису.
+// Тимчасовий маршрут: показує локації, співробітників, ресурси (пости) і
+// записи на найближчі 14 днів, щоб правильно налаштувати пошук вільних слотів.
+// Відкривати в браузері: /api/roapp-check?secret=ЗНАЧЕННЯ_ROAPP_DEBUG_SECRET
+// Після налаштування онлайн-запису цей маршрут можна видалити.
+// ---------------------------------------------------------------------------
+const ROAPP_API_KEY = process.env.ROAPP_API_KEY || "";
+const ROAPP_BASE = "https://api.roapp.io/v2";
+
+async function roappGet(pathAndQuery) {
+  const resp = await fetch(ROAPP_BASE + pathAndQuery, {
+    headers: {
+      Authorization: `Bearer ${ROAPP_API_KEY}`,
+      Accept: "application/json",
+    },
+  });
+  const text = await resp.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch (e) {
+    body = text.slice(0, 2000);
+  }
+  return { status: resp.status, body };
+}
+
+app.get("/api/roapp-check", async (req, res) => {
+  if (!process.env.ROAPP_DEBUG_SECRET || req.query.secret !== process.env.ROAPP_DEBUG_SECRET) {
+    return res.sendStatus(403);
+  }
+  if (!ROAPP_API_KEY) {
+    return res.json({ error: "ROAPP_API_KEY не задано в Render Environment" });
+  }
+  try {
+    const from = new Date();
+    const to = new Date(from.getTime() + 14 * 24 * 60 * 60 * 1000);
+    const f = encodeURIComponent(from.toISOString());
+    const t = encodeURIComponent(to.toISOString());
+
+    const result = {};
+    result.locations = await roappGet("/company/locations?is_archived=false");
+    result.employees = await roappGet("/company/employees");
+
+    const locList =
+      (result.locations.body && (result.locations.body.data || result.locations.body.items)) ||
+      (Array.isArray(result.locations.body) ? result.locations.body : []);
+    result.resources = {};
+    for (const loc of (locList || []).slice(0, 5)) {
+      if (loc && loc.id) {
+        result.resources[loc.id] = await roappGet(`/company/locations/${loc.id}/resources`);
+      }
+    }
+
+    // Два варіанти запису масиву в URL — щоб побачити, який розуміє API.
+    result.bookings_brackets = await roappGet(
+      `/bookings?sort=scheduled_for&scheduled_for[]=${f}&scheduled_for[]=${t}`
+    );
+    result.bookings_plain = await roappGet(
+      `/bookings?sort=scheduled_for&scheduled_for=${f}&scheduled_for=${t}`
+    );
+
+    res.json(result);
+  } catch (err) {
+    console.error("roapp-check error:", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`AvtoFizika bot server запущен на порту ${PORT}`);
 });
