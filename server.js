@@ -709,7 +709,9 @@ const BOOKING_SERVICES = {
     title: "Задні ліхтарі (переробка поворотників / ремонт задніх ліхтарів; НЕ світловоди)",
     crmName: "Задні ліхтарі", // коротка назва для CRM
     masters: [106873],
-    slots: [["09:00", "14:00"], ["14:00", "19:00"]], // до 2 авто на день
+    slots: [["09:00", "10:00"]], // клієнт приїжджає зранку 9:00–10:00
+    capacity: 2, // до 2 авто на день, незалежно від часу
+    arrivalNote: "приїхати зранку з 9:00 до 10:00, щоб майстер встиг усе зробити за день; авто залишається на день",
     box: BOX_SVITLYI,
     orderTypeId: 322214, // Ліхтарі Автофізика
     manager: MANAGER_ANDRII,
@@ -943,7 +945,9 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
       const jobs = bookings.filter(
         (b) => b.assignees.includes(Number(mId)) && b.start < dayEnd && (b.end || b.start) > dayStart
       );
-      if (jobs.length >= svc.slots.length) continue; // день у майстра заповнений
+      const cap = svc.capacity || svc.slots.length;
+      if (jobs.length >= cap) continue; // день у майстра заповнений
+      if (svc.capacity) { chosen = { mId, idx: 0 }; break; } // лише ліміт авто на день, час не важливий
       // Перше вікно, яке не перетинається з наявними роботами; інакше — наступне по черзі
       let idx = svc.slots.findIndex(([s, e]) => {
         const st = kyivToDate(p.y, p.m, p.d, s);
@@ -964,7 +968,9 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
       result.push({
         slot_id: slotId,
         day: dayLabel(start),
-        time: svc.slots.length === 1 ? `з ${s} (машину залишають на день)` : `${s}–${e}`,
+        time: svc.arrivalNote
+          ? `${s}–${e} (${svc.arrivalNote})`
+          : svc.slots.length === 1 ? `з ${s} (машину залишають на день)` : `${s}–${e}`,
         master: MASTERS[master],
       });
     }
@@ -999,14 +1005,15 @@ async function bookSlot(userId, input, source) {
   const start = new Date(slot.start);
   const end = new Date(slot.end);
   const bookings = await fetchBusy(new Date(start.getTime() - 7 * 24 * 3600 * 1000), new Date(end.getTime() + 3600 * 1000));
-  const svcCap = BOOKING_SERVICES[slot.serviceKey].slots.length;
+  const svcDef = BOOKING_SERVICES[slot.serviceKey];
+  const svcCap = svcDef.capacity || svcDef.slots.length;
   const sp = kyivParts(start);
   const dS = kyivToDate(sp.y, sp.m, sp.d, WORK_START);
   const dE = kyivToDate(sp.y, sp.m, sp.d, WORK_END);
   const dayJobs = bookings.filter(
     (b) => b.assignees.includes(Number(slot.masterId)) && b.start < dE && (b.end || b.start) > dS
   );
-  if (dayJobs.length >= svcCap || masterBusy(dayJobs, slot.masterId, start, end)) {
+  if (dayJobs.length >= svcCap || (!svcDef.capacity && masterBusy(dayJobs, slot.masterId, start, end))) {
     return { ok: false, error: "Це вікно вже зайняли. Виклич find_free_slots ще раз і запропонуй інші варіанти." };
   }
 
