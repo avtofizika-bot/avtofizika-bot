@@ -638,6 +638,30 @@ app.get("/api/roapp-check", async (req, res) => {
       `/bookings?sort=scheduled_for&scheduled_for=${f}&scheduled_for=${t}`
     );
 
+    result.orders_scheduled = await roappGet(
+      `/orders?branch_ids=${ROAPP_BRANCH_ID}&scheduled_for=${f}&scheduled_for=${t}`
+    );
+    result.orders_due = await roappGet(
+      `/orders?branch_ids=${ROAPP_BRANCH_ID}&due_date=${f}&due_date=${t}`
+    );
+    // Як бот бачить зайнятість майстрів (після розбору записів і замовлень)
+    try {
+      const busy = await fetchBusy(new Date(from.getTime() - 7 * 24 * 3600 * 1000), to);
+      result.busy_as_bot_sees = busy.map((b) => ({
+        source: b.source || "booking",
+        id: b.id,
+        start: b.start && b.start.toISOString(),
+        end: b.end && b.end.toISOString(),
+        masters: b.assignees.map((id) => MASTERS[id] || id),
+      }));
+    } catch (e) {
+      result.busy_error = String(e);
+    }
+    // Щоб відповідь не була завеликою — обрізаємо списки до 5 елементів
+    for (const k of ["bookings_brackets", "bookings_plain", "orders_scheduled", "orders_due"]) {
+      const b = result[k] && result[k].body;
+      if (b && Array.isArray(b.data)) b.data = b.data.slice(0, 5);
+    }
     res.json(result);
   } catch (err) {
     console.error("roapp-check error:", err);
@@ -769,7 +793,7 @@ function bookingAssigneeIds(b) {
 }
 function bookingIsCancelled(b) {
   const s = JSON.stringify(b.status || "").toLowerCase();
-  return s.includes("скас") || s.includes("отмен") || s.includes("cancel");
+  return s.includes("скас") || s.includes("отмен") || s.includes("cancel") || s.includes("відмов") || s.includes("отказ");
 }
 
 async function fetchBookings(from, to) {
@@ -793,8 +817,70 @@ async function fetchBookings(from, to) {
       start: pickDate(b.scheduled_for || b.start || b.starts_at),
       end: pickDate(b.scheduled_to || b.end || b.ends_at),
       assignees: bookingAssigneeIds(b),
+      source: "booking",
+      id: b.id,
     }))
     .filter((b) => b.start);
+}
+
+// Замовлення (роботи) майстра теж займають його час.
+// Інтервал замовлення: від scheduled_for до due_date; якщо due_date немає —
+// до кінця робочого дня; якщо немає scheduled_for — весь день due_date.
+function orderAssigneeIds(o) {
+  const ids = [];
+  const add = (v) => { if (v && (v.id || typeof v === "number" || typeof v === "string")) ids.push(Number(v.id || v)); };
+  add(o.engineer_id); add(o.engineer); add(o.assignee_id); add(o.assignee);
+  add(o.employee_id); add(o.employee);
+  ["engineers", "assignees", "employees"].forEach((k) => { if (Array.isArray(o[k])) o[k].forEach(add); });
+  return ids.filter((x) => !isNaN(x));
+}
+function endOfWorkday(date) {
+  const p = kyivParts(date);
+  return kyivToDate(p.y, p.m, p.d, WORK_END);
+}
+function startOfWorkday(date) {
+  const p = kyivParts(date);
+  return kyivToDate(p.y, p.m, p.d, WORK_START);
+}
+async function fetchOrdersRange(field, from, to) {
+  const all = [];
+  for (let page = 1; page <= 20; page++) {
+    const q =
+      `/orders?page=${page}&branch_ids=${ROAPP_BRANCH_ID}` +
+      `&${field}=${encodeURIComponent(isoZ(from))}&${field}=${encodeURIComponent(isoZ(to))}`;
+    const r = await roappGet(q);
+    if (r.status !== 200) {
+      throw new Error(`RO App orders ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`);
+    }
+    const list = Array.isArray(r.body) ? r.body : r.body.data || [];
+    all.push(...list);
+    const totalPages = (r.body.paging && r.body.paging.total_pages) || 1;
+    if (page >= totalPages || list.length === 0) break;
+  }
+  return all;
+}
+async function fetchOrders(from, to) {
+  const byId = new Map();
+  for (const field of ["scheduled_for", "due_date"]) {
+    for (const o of await fetchOrdersRange(field, from, to)) byId.set(o.id, o);
+  }
+  const res = [];
+  for (const o of byId.values()) {
+    if (o.closed_at) continue; // закриті замовлення не займають майстра
+    if (bookingIsCancelled(o)) continue; // "Відмова" / скасовані
+    let start = pickDate(o.scheduled_for);
+    let end = pickDate(o.scheduled_to) || pickDate(o.due_date);
+    if (!start && !end) continue;
+    if (!start) { start = startOfWorkday(end); end = endOfWorkday(end); }
+    if (!end || end <= start) end = endOfWorkday(start);
+    res.push({ start, end, assignees: orderAssigneeIds(o), source: "order", id: o.id });
+  }
+  return res;
+}
+// Уся зайнятість: записи + замовлення
+async function fetchBusy(from, to) {
+  const [bookings, orders] = await Promise.all([fetchBookings(from, to), fetchOrders(from, to)]);
+  return bookings.concat(orders);
 }
 
 function masterBusy(bookings, masterId, start, end) {
@@ -814,7 +900,7 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
 
   const now = new Date();
   const until = new Date(now.getTime() + BOOKING_DAYS_AHEAD * 24 * 3600 * 1000);
-  const bookings = await fetchBookings(new Date(now.getTime() - 24 * 3600 * 1000), until);
+  const bookings = await fetchBusy(new Date(now.getTime() - 7 * 24 * 3600 * 1000), until);
 
   const result = [];
   const cache = {};
@@ -822,12 +908,31 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
   for (let i = 1; i <= BOOKING_DAYS_AHEAD && result.length < maxResults; i++) {
     const p = kyivParts(new Date(now.getTime() + i * 24 * 3600 * 1000));
     if (!WORK_DAYS.includes(p.wd)) continue;
-    for (const [s, e] of svc.slots) {
-      if (result.length >= maxResults) break;
+    // Місткість майстра на день = кількість вікон послуги (напр. 2 авто на день).
+    // День зайнятий, якщо в майстра вже стільки робіт (замовлень/записів), скільки вікон.
+    const dayStart = kyivToDate(p.y, p.m, p.d, WORK_START);
+    const dayEnd = kyivToDate(p.y, p.m, p.d, WORK_END);
+    let chosen = null;
+    for (const mId of svc.masters) {
+      const jobs = bookings.filter(
+        (b) => b.assignees.includes(Number(mId)) && b.start < dayEnd && (b.end || b.start) > dayStart
+      );
+      if (jobs.length >= svc.slots.length) continue; // день у майстра заповнений
+      // Перше вікно, яке не перетинається з наявними роботами; інакше — наступне по черзі
+      let idx = svc.slots.findIndex(([s, e]) => {
+        const st = kyivToDate(p.y, p.m, p.d, s);
+        const en = kyivToDate(p.y, p.m, p.d, e);
+        return !masterBusy(jobs, mId, st, en);
+      });
+      if (idx < 0) idx = jobs.length;
+      chosen = { mId, idx };
+      break;
+    }
+    if (chosen) {
+      const [s, e] = svc.slots[chosen.idx];
       const start = kyivToDate(p.y, p.m, p.d, s);
       const end = kyivToDate(p.y, p.m, p.d, e);
-      const master = svc.masters.find((mId) => !masterBusy(bookings, mId, start, end));
-      if (!master) continue;
+      const master = chosen.mId;
       const slotId = `S${Object.keys(cache).length + 1}`;
       cache[slotId] = { serviceKey, masterId: master, start: isoZ(start), end: isoZ(end) };
       result.push({
@@ -836,7 +941,6 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
         time: svc.slots.length === 1 ? `з ${s} (машину залишають на день)` : `${s}–${e}`,
         master: MASTERS[master],
       });
-      break; // не більше одного вікна на день — щоб варіанти були на різні дні
     }
   }
   offeredSlots.set(userId, cache);
@@ -867,8 +971,15 @@ async function bookSlot(userId, input, source) {
   // Перевіряємо ще раз, чи вікно досі вільне
   const start = new Date(slot.start);
   const end = new Date(slot.end);
-  const bookings = await fetchBookings(new Date(start.getTime() - 24 * 3600 * 1000), new Date(end.getTime() + 3600 * 1000));
-  if (masterBusy(bookings, slot.masterId, start, end)) {
+  const bookings = await fetchBusy(new Date(start.getTime() - 7 * 24 * 3600 * 1000), new Date(end.getTime() + 3600 * 1000));
+  const svcCap = BOOKING_SERVICES[slot.serviceKey].slots.length;
+  const sp = kyivParts(start);
+  const dS = kyivToDate(sp.y, sp.m, sp.d, WORK_START);
+  const dE = kyivToDate(sp.y, sp.m, sp.d, WORK_END);
+  const dayJobs = bookings.filter(
+    (b) => b.assignees.includes(Number(slot.masterId)) && b.start < dE && (b.end || b.start) > dS
+  );
+  if (dayJobs.length >= svcCap || masterBusy(dayJobs, slot.masterId, start, end)) {
     return { ok: false, error: "Це вікно вже зайняли. Виклич find_free_slots ще раз і запропонуй інші варіанти." };
   }
 
@@ -890,9 +1001,9 @@ async function bookSlot(userId, input, source) {
     // У документації scheduled_to описано як масив — пробуємо і так
     r = await roappPost("/bookings", { ...body, scheduled_to: [slot.end] });
   }
-  console.log("RO App створення запису:", r.status, r.text.slice(0, 500));
+  console.log("RO App створення запису:", r.status, r.text.slice(0, 1000), JSON.stringify(body));
   if (r.status >= 400) {
-    return { ok: false, error: "Не вдалося створити запис у CRM. Скажи клієнту, що менеджер підтвердить час дзвінком." };
+    return { ok: false, error: "Запис НЕ створено через помилку CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити зручний час." };
   }
   delete cache[input.slot_id];
   return { ok: true, day: dayLabel(start), master: MASTERS[slot.masterId], service: svc.title };
@@ -941,7 +1052,7 @@ async function runBookingTool(userId, name, input, source) {
     return { error: "Невідомий інструмент" };
   } catch (err) {
     console.error(`Помилка інструмента ${name}:`, err);
-    return { error: "Система запису тимчасово недоступна. Запропонуй клієнту зворотний дзвінок менеджера." };
+    return { error: "Система запису тимчасово недоступна, запис НЕ створено. Не підтверджуй клієнту жодну дату — запропонуй зворотний дзвінок менеджера для узгодження часу." };
   }
 }
 
