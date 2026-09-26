@@ -706,7 +706,7 @@ const MANAGER_ANDRII = 182452; // Андрей П
 const FULL_DAY = [[WORK_START, WORK_END]];
 const BOOKING_SERVICES = {
   tail_lights: {
-    title: "Задні ліхтарі (переробка поворотників / ремонт)",
+    title: "Задні ліхтарі (переробка поворотників / ремонт задніх ліхтарів; НЕ світловоди)",
     masters: [106873],
     slots: [["09:00", "14:00"], ["14:00", "19:00"]], // до 2 авто на день
     box: BOX_SVITLYI,
@@ -714,7 +714,7 @@ const BOOKING_SERVICES = {
     manager: MANAGER_ANDRII,
   },
   headlight_repair: {
-    title: "Ремонт / переупаковка фар, заміна скла",
+    title: "Ремонт / переупаковка фар, заміна скла, заміна/ремонт світловоду (світловод — це завжди передні фари)",
     masters: [277961, 300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
