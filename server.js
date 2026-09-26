@@ -638,6 +638,8 @@ app.get("/api/roapp-check", async (req, res) => {
       `/bookings?sort=scheduled_for&scheduled_for=${f}&scheduled_for=${t}`
     );
 
+    result.order_types = await roappGet("/orders/types");
+    result.order_custom_fields = await roappGet("/orders/custom-fields");
     result.orders_scheduled = await roappGet(
       `/orders?branch_ids=${ROAPP_BRANCH_ID}&scheduled_for=${f}&scheduled_for=${t}`
     );
@@ -696,6 +698,9 @@ const MASTERS = {
 const BOX_MOKRYI = 106819; // Мокрий Бокс
 const BOX_SVITLYI = 106818; // Світлий Бокс
 const BOX_TYKHYI = 106585; // Тихий Бокс
+// Менеджери
+const MANAGER_ANASTASIA = 302312; // Анастасія Бонка
+const MANAGER_ANDRII = 182452; // Андрей П
 
 // slots — вікна протягом дня [початок, кінець]. Повний день = одне вікно 09:00–19:00.
 const FULL_DAY = [[WORK_START, WORK_END]];
@@ -705,42 +710,56 @@ const BOOKING_SERVICES = {
     masters: [106873],
     slots: [["09:00", "14:00"], ["14:00", "19:00"]], // до 2 авто на день
     box: BOX_SVITLYI,
+    orderType: "Ліхтарі Автофізика", // тип замовлення в RO App
+    manager: MANAGER_ANDRII,
   },
   headlight_repair: {
     title: "Ремонт / переупаковка фар, заміна скла",
     masters: [277961, 300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
+    orderType: "Платний ремонт", // тип замовлення в RO App
+    manager: MANAGER_ANASTASIA,
   },
   headlight_polish_film: {
     title: "Шліфування / полірування фар + плівка на фари",
     masters: [300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
+    orderType: "Поклейка плівки", // тип замовлення в RO App
+    manager: MANAGER_ANDRII,
   },
   bi_led: {
     title: "Встановлення Bi-LED / покращення світла",
     masters: [149533],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
+    orderType: "Платний ремонт", // тип замовлення в RO App
+    manager: MANAGER_ANASTASIA,
   },
   wash: {
     title: "Мийка",
     masters: [302319],
     slots: [["09:00", "12:00"], ["14:00", "17:00"]], // до 2 авто на день
     box: BOX_MOKRYI,
+    orderType: "Детейлінг", // тип замовлення в RO App
+    manager: MANAGER_ANDRII,
   },
   detailing: {
     title: "Детейлінг: мийка + хімчистка, полірування кузова, кераміка",
     masters: [302319],
     slots: FULL_DAY,
     box: BOX_MOKRYI,
+    orderType: "Детейлінг", // тип замовлення в RO App
+    manager: MANAGER_ANDRII,
   },
   body_film: {
     title: "Захисна плівка на кузов",
     masters: [321357],
     slots: FULL_DAY,
     box: BOX_TYKHYI,
+    orderType: "Поклейка плівки", // тип замовлення в RO App
+    manager: MANAGER_ANDRII,
   },
 };
 
@@ -967,6 +986,7 @@ async function bookSlot(userId, input, source) {
   const slot = cache[input.slot_id];
   if (!slot) return { ok: false, error: "Слот не знайдено — спочатку виклич find_free_slots і запропонуй вікна клієнту." };
   if (!input.name || !input.phone) return { ok: false, error: "Потрібні ім'я і телефон клієнта." };
+  if (!input.brand || !input.model || !input.year) return { ok: false, error: "Потрібні марка, модель і рік випуску авто — запитай у клієнта." };
 
   // Перевіряємо ще раз, чи вікно досі вільне
   const start = new Date(slot.start);
@@ -984,29 +1004,111 @@ async function bookSlot(userId, input, source) {
   }
 
   const svc = BOOKING_SERVICES[slot.serviceKey];
-  const comment =
-    `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}. ` +
-    `Послуга: ${svc.title}. ${input.car ? "Авто: " + input.car + ". " : ""}${input.comment || ""}`.trim();
 
+  // 1) Клієнт: шукаємо за телефоном, якщо немає — створюємо
+  const clientId = await findOrCreateClient(input.name, input.phone);
+  if (!clientId) {
+    return { ok: false, error: "Запис НЕ створено: не вдалося знайти/створити клієнта в CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити час." };
+  }
+
+  // 2) Тип замовлення
+  const orderTypeId = await getOrderTypeId(svc.orderType);
+  if (!orderTypeId) {
+    return { ok: false, error: "Запис НЕ створено: не знайдено тип замовлення в CRM. Не підтверджуй дату, запропонуй дзвінок менеджера." };
+  }
+
+  // 3) Створюємо Замовлення на майстра (як у вашому розкладі: 1 година від початку вікна)
+  const orderStart = new Date(slot.start);
+  const orderEnd = new Date(orderStart.getTime() + 60 * 60000);
   const body = {
     branch_id: ROAPP_BRANCH_ID,
+    order_type_id: orderTypeId,
+    client_id: clientId,
+    manager_id: svc.manager || ROAPP_MANAGER_ID,
     assignee_id: slot.masterId,
-    scheduled_for: slot.start,
-    scheduled_to: slot.end,
+    scheduled_for: isoZ(orderStart),
+    scheduled_to: isoZ(orderEnd),
     resource_id: svc.box,
-    comment,
+    malfunction: `${svc.title}. Авто: ${carText(input)}${input.comment ? ". " + input.comment : ""}`.slice(0, 500),
+    manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.`,
   };
-  let r = await roappPost("/bookings", body);
-  if (r.status >= 400) {
-    // У документації scheduled_to описано як масив — пробуємо і так
-    r = await roappPost("/bookings", { ...body, scheduled_to: [slot.end] });
-  }
-  console.log("RO App створення запису:", r.status, r.text.slice(0, 1000), JSON.stringify(body));
+  const r = await roappPost("/orders", body);
+  console.log("RO App створення замовлення:", r.status, r.text.slice(0, 1000), JSON.stringify(body));
   if (r.status >= 400) {
     return { ok: false, error: "Запис НЕ створено через помилку CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити зручний час." };
   }
   delete cache[input.slot_id];
   return { ok: true, day: dayLabel(start), master: MASTERS[slot.masterId], service: svc.title };
+}
+
+// ---------- клієнт і тип замовлення для онлайн-запису ----------
+const ROAPP_MANAGER_ID = Number(process.env.ROAPP_MANAGER_ID || 302312); // Анастасія Бонка
+let cachedOrderTypeId = process.env.ROAPP_ORDER_TYPE_ID ? Number(process.env.ROAPP_ORDER_TYPE_ID) : null;
+
+function normalizePhone(raw) {
+  let d = String(raw || "").replace(/\D/g, "");
+  if (d.length === 10 && d.startsWith("0")) d = "38" + d; // 0671234567 -> 380671234567
+  if (d.length === 9) d = "380" + d;
+  return d;
+}
+function listFrom(body) {
+  return Array.isArray(body) ? body : (body && (body.data || body.items)) || [];
+}
+async function findClientByPhone(digits) {
+  const r = await roappGet(`/contacts/people?phones=${encodeURIComponent(digits)}`);
+  if (r.status !== 200) {
+    console.error("RO App пошук клієнта:", r.status, JSON.stringify(r.body).slice(0, 300));
+    return null;
+  }
+  const p = listFrom(r.body)[0];
+  return p && p.id ? Number(p.id) : null;
+}
+async function findOrCreateClient(name, phone) {
+  const digits = normalizePhone(phone);
+  let id = await findClientByPhone(digits);
+  if (id) return id;
+  const parts = String(name || "Клієнт").trim().split(/\s+/);
+  const body = {
+    first_name: parts[0] || "Клієнт",
+    last_name: parts.slice(1).join(" ") || undefined,
+    phones: [{ title: "Мобільний", phone: "+" + digits, notify: true, has_viber: false, has_whatsapp: false }],
+    notes: "Створено чат-ботом (онлайн-запис)",
+  };
+  const r = await roappPost("/contacts/people", body);
+  console.log("RO App створення клієнта:", r.status, r.text.slice(0, 500));
+  try {
+    const j = JSON.parse(r.text);
+    const newId = (j && (j.id || (j.data && j.data.id))) || null;
+    if (newId) return Number(newId);
+  } catch (e) {}
+  // Якщо API не повернуло id — шукаємо ще раз за телефоном
+  return await findClientByPhone(digits);
+}
+function carText(input) {
+  const parts = [input.brand, input.model, input.year].filter(Boolean).join(" ");
+  return parts || input.car || "не вказано";
+}
+let cachedOrderTypes = null;
+const normName = (x) => String(x || "").toLowerCase().replace(/[ʼ'`’]/g, "").replace(/\s+/g, " ").trim();
+async function getOrderTypeId(typeName) {
+  if (!cachedOrderTypes) {
+    const r = await roappGet("/orders/types");
+    const list = listFrom(r.body);
+    console.log("RO App типи замовлень:", JSON.stringify(list.map((t) => ({ id: t.id, name: t.name || t.title }))).slice(0, 800));
+    if (list.length) cachedOrderTypes = list;
+  }
+  const list = cachedOrderTypes || [];
+  const want = normName(typeName);
+  // Точний збіг назви, потім — часткові збіги (напр. "поклейка плівки" / "плівка")
+  let t = list.find((x) => normName(x.name || x.title) === want);
+  if (!t) t = list.find((x) => normName(x.name || x.title).includes(want) || want.includes(normName(x.name || x.title)));
+  if (!t && want.includes("плів")) t = list.find((x) => normName(x.name || x.title).includes("плів"));
+  if (!t) {
+    console.warn(`Тип замовлення "${typeName}" не знайдено, використовую запасний`);
+    if (cachedOrderTypeId) return cachedOrderTypeId;
+    t = list[0];
+  }
+  return t && t.id ? Number(t.id) : null;
 }
 
 const BOOKING_TOOLS = [
@@ -1030,17 +1132,19 @@ const BOOKING_TOOLS = [
   {
     name: "book_slot",
     description:
-      "Створює запис у CRM на обране клієнтом вікно. Викликай ЛИШЕ після того, як клієнт обрав один із запропонованих варіантів і назвав ім'я та телефон.",
+      "Створює замовлення в CRM на обране клієнтом вікно. Викликай ЛИШЕ після того, як клієнт обрав один із запропонованих варіантів і відомі: ім'я, телефон, марка, модель і рік випуску авто (якщо чогось бракує — спершу запитай у клієнта).",
     input_schema: {
       type: "object",
       properties: {
         slot_id: { type: "string", description: "slot_id з результату find_free_slots" },
         name: { type: "string" },
         phone: { type: "string" },
-        car: { type: "string", description: "Марка, модель, рік авто (якщо відомо)" },
+        brand: { type: "string", description: "Марка авто (напр. BMW)" },
+        model: { type: "string", description: "Модель авто (напр. X3)" },
+        year: { type: "string", description: "Рік випуску авто (напр. 2022)" },
         comment: { type: "string", description: "Коротко суть запиту клієнта" },
       },
-      required: ["slot_id", "name", "phone"],
+      required: ["slot_id", "name", "phone", "brand", "model", "year"],
     },
   },
 ];
