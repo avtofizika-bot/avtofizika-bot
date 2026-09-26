@@ -189,6 +189,14 @@ async function askClaude(userId, content, source = "chat") {
     systemPrompt += "\n\n" + PROMPT_DETAILING;
   }
 
+  // Контроль номера телефону: якщо клієнт написав некоректний номер — просимо виправити
+  const phoneCandidates = (latestUserText.match(/\+?\d[\d\s\-()]{6,}\d/g) || [])
+    .filter((x) => x.replace(/\D/g, "").length >= 7);
+  const badPhones = phoneCandidates.filter((x) => !isValidPhone(x));
+  if (badPhones.length) {
+    systemPrompt += `\n\n## УВАГА: некоректний номер телефону\nКлієнт щойно написав номер «${badPhones[0].trim()}», але він некоректний (неповний або неіснуючий код оператора). НЕ пиши, що заявку передано, і не створюй запис. Ввічливо попроси клієнта перевірити номер і написати його повністю, наприклад 067 123 45 67.`;
+  }
+
   // Онлайн-запис: інструменти пошуку вільних вікон і створення запису в RO App
   const tools = BOOKING_ENABLED ? BOOKING_TOOLS : undefined;
   if (BOOKING_ENABLED) {
@@ -330,6 +338,11 @@ async function extractLeadFromConversation(userId) {
 // Відправляє дані ліда у Make.com, який далі створює звернення в РемОнлайн.
 // ---------------------------------------------------------------------------
 async function sendLeadToCRM(lead, source) {
+  if (!isValidPhone(lead.phone)) {
+    console.warn("Лід НЕ відправлено — некоректний номер телефону:", lead.phone);
+    return false;
+  }
+  lead = { ...lead, phone: "+" + normalizePhone(lead.phone) };
   if (!MAKE_WEBHOOK_URL) {
     console.warn("MAKE_WEBHOOK_URL не задано, лід не відправлено:", lead);
     return;
@@ -462,7 +475,7 @@ app.post("/webhook/telegram", async (req, res) => {
 
     if (!leadAlreadySent.has(telegramUserId)) {
       const lead = await extractLeadFromConversation(telegramUserId);
-      if (lead) {
+      if (lead && isValidPhone(lead.phone)) {
         leadAlreadySent.add(telegramUserId);
         sendLeadToCRM(lead, "telegram");
       }
@@ -502,7 +515,7 @@ app.post("/api/chat", async (req, res) => {
 
     if (!leadAlreadySent.has(siteUserId)) {
       const lead = await extractLeadFromConversation(siteUserId);
-      if (lead) {
+      if (lead && isValidPhone(lead.phone)) {
         leadAlreadySent.add(siteUserId);
         sendLeadToCRM(lead, "website");
       }
@@ -552,7 +565,7 @@ app.post("/webhook/instagram", async (req, res) => {
 
     if (!leadAlreadySent.has(instagramUserId)) {
       const lead = await extractLeadFromConversation(instagramUserId);
-      if (lead) {
+      if (lead && isValidPhone(lead.phone)) {
         leadAlreadySent.add(instagramUserId);
         sendLeadToCRM(lead, "instagram");
       }
@@ -999,6 +1012,7 @@ async function bookSlot(userId, input, source) {
   const slot = cache[input.slot_id];
   if (!slot) return { ok: false, error: "Слот не знайдено — спочатку виклич find_free_slots і запропонуй вікна клієнту." };
   if (!input.name || !input.phone) return { ok: false, error: "Потрібні ім'я і телефон клієнта." };
+  if (!isValidPhone(input.phone)) return { ok: false, error: "Номер телефону некоректний. Запис ще НЕ створено. Попроси клієнта перевірити номер і написати його повністю (наприклад, 067 123 45 67), потім знову виклич book_slot." };
   if (!input.brand || !input.model || !input.year) return { ok: false, error: "Потрібні марка, модель і рік випуску авто — запитай у клієнта." };
 
   // Перевіряємо ще раз, чи вікно досі вільне
@@ -1066,13 +1080,66 @@ async function bookSlot(userId, input, source) {
     return { ok: false, error: "Запис НЕ створено через помилку CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити зручний час." };
   }
   delete cache[input.slot_id];
-  return { ok: true, day: dayLabel(start), master: MASTERS[slot.masterId], service: svc.title };
+
+  // Клієнт уже записаний у Замовлення — окреме Звернення не створюємо (щоб не дублювати)
+  leadAlreadySent.add(userId);
+
+  // Нагадування менеджеру (завдання в RO App через Make)
+  let order = {};
+  try { order = JSON.parse(r.text); } catch (e) {}
+  sendOrderReminder({
+    order_id: order.id || null,
+    order_number: order.number || "",
+    manager_id: body.manager_id,
+    manager_name: body.manager_id === MANAGER_ANDRII ? "Андрей П" : "Анастасія Бонка",
+    master: MASTERS[slot.masterId],
+    service: svc.crmName || svc.title,
+    scheduled_for_text: `${dayLabel(orderStart)}, ${orderStart.toLocaleTimeString("uk-UA", { timeZone: "Europe/Kyiv", hour: "2-digit", minute: "2-digit" })}`,
+    client_name: input.name,
+    client_phone: "+" + normalizePhone(input.phone),
+    car: carText(input),
+    source,
+  });
+
+  return { ok: true, day: dayLabel(start), master: MASTERS[slot.masterId], service: svc.title, order_number: order.number || "" };
+}
+
+// Відправляє дані нового онлайн-замовлення в Make (окремий сценарій),
+// який створює в RO App завдання-нагадування для менеджера.
+const MAKE_ORDER_WEBHOOK_URL = process.env.MAKE_ORDER_WEBHOOK_URL || "";
+async function sendOrderReminder(data) {
+  if (!MAKE_ORDER_WEBHOOK_URL) {
+    console.warn("MAKE_ORDER_WEBHOOK_URL не задано — нагадування менеджеру не відправлено:", data.order_number);
+    return;
+  }
+  try {
+    await fetch(MAKE_ORDER_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    console.log("Нагадування менеджеру відправлено в Make:", data.order_number, data.manager_name);
+  } catch (err) {
+    console.error("Помилка відправки нагадування в Make:", err);
+  }
 }
 
 // ---------- клієнт і тип замовлення для онлайн-запису ----------
 const ROAPP_MANAGER_ID = Number(process.env.ROAPP_MANAGER_ID || 302312); // Анастасія Бонка
 let cachedOrderTypeId = process.env.ROAPP_ORDER_TYPE_ID ? Number(process.env.ROAPP_ORDER_TYPE_ID) : null;
 
+// Перевірка українського номера (мобільні оператори + міські коди)
+const UA_MOBILE_CODES = ["39","50","63","66","67","68","73","77","89","91","92","93","94","95","96","97","98","99"];
+function isValidPhone(raw) {
+  const d = normalizePhone(raw);
+  if (/^(\d)\1+$/.test(d.slice(3))) return false; // 0000000, 1111111...
+  if (d.startsWith("380")) {
+    if (d.length !== 12) return false;
+    const code = d.slice(3, 5);
+    return UA_MOBILE_CODES.includes(code) || /^[3-6]/.test(code); // мобільні або міські
+  }
+  return d.length >= 10 && d.length <= 15; // іноземні номери
+}
 function normalizePhone(raw) {
   let d = String(raw || "").replace(/\D/g, "");
   if (d.length === 10 && d.startsWith("0")) d = "38" + d; // 0671234567 -> 380671234567
@@ -1117,16 +1184,15 @@ async function findOrCreateClient(name, phone) {
 let cachedCarFields = null;
 async function getCarFieldIds() {
   if (cachedCarFields) return cachedCarFields;
-  const ids = { brand: "f1492401", model: "f1492402", year: null }; // запасні значення
+  // Перевірено на реальному замовленні: f1492402 = Марка, f1492401 = Модель
+  const ids = { brand: "f1492402", model: "f1492401", year: null };
   try {
     const r = await roappGet("/orders/custom-fields");
     const list = listFrom(r.body);
     console.log("RO App поля замовлення:", JSON.stringify(list.map((f) => ({ id: f.id, name: f.name || f.title }))).slice(0, 800));
     const find = (re) => list.find((f) => re.test(String(f.name || f.title || "").toLowerCase()));
-    const b = find(/марк|brand/), mo = find(/модел|model/), y = find(/рік|год|year/);
-    if (b) ids.brand = "f" + b.id;
-    if (mo) ids.model = "f" + mo.id;
-    if (y) ids.year = "f" + y.id;
+    const y = find(/рік|год|year/);
+    if (y) ids.year = "f" + y.id; // марку/модель не перевизначаємо — ID вище перевірені
   } catch (e) {
     console.error("Не вдалося отримати поля замовлення:", e);
   }
