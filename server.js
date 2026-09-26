@@ -710,7 +710,7 @@ const BOOKING_SERVICES = {
     masters: [106873],
     slots: [["09:00", "14:00"], ["14:00", "19:00"]], // до 2 авто на день
     box: BOX_SVITLYI,
-    orderType: "Ліхтарі Автофізика", // тип замовлення в RO App
+    orderTypeId: 322214, // Ліхтарі Автофізика
     manager: MANAGER_ANDRII,
   },
   headlight_repair: {
@@ -718,7 +718,7 @@ const BOOKING_SERVICES = {
     masters: [277961, 300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
-    orderType: "Платний ремонт", // тип замовлення в RO App
+    orderTypeId: 96639, // Платный ремонт
     manager: MANAGER_ANASTASIA,
   },
   headlight_polish_film: {
@@ -726,7 +726,7 @@ const BOOKING_SERVICES = {
     masters: [300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
-    orderType: "Поклейка плівки", // тип замовлення в RO App
+    orderTypeId: 196597, // Поклейка пленки
     manager: MANAGER_ANDRII,
   },
   bi_led: {
@@ -734,7 +734,7 @@ const BOOKING_SERVICES = {
     masters: [149533],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
-    orderType: "Платний ремонт", // тип замовлення в RO App
+    orderTypeId: 96639, // Платный ремонт
     manager: MANAGER_ANASTASIA,
   },
   wash: {
@@ -742,7 +742,7 @@ const BOOKING_SERVICES = {
     masters: [302319],
     slots: [["09:00", "12:00"], ["14:00", "17:00"]], // до 2 авто на день
     box: BOX_MOKRYI,
-    orderType: "Детейлінг", // тип замовлення в RO App
+    orderTypeId: 196595, // Детейлинг
     manager: MANAGER_ANDRII,
   },
   detailing: {
@@ -750,7 +750,7 @@ const BOOKING_SERVICES = {
     masters: [302319],
     slots: FULL_DAY,
     box: BOX_MOKRYI,
-    orderType: "Детейлінг", // тип замовлення в RO App
+    orderTypeId: 196595, // Детейлинг
     manager: MANAGER_ANDRII,
   },
   body_film: {
@@ -758,7 +758,7 @@ const BOOKING_SERVICES = {
     masters: [321357],
     slots: FULL_DAY,
     box: BOX_TYKHYI,
-    orderType: "Поклейка плівки", // тип замовлення в RO App
+    orderTypeId: 196597, // Поклейка пленки
     manager: MANAGER_ANDRII,
   },
 };
@@ -1012,7 +1012,7 @@ async function bookSlot(userId, input, source) {
   }
 
   // 2) Тип замовлення
-  const orderTypeId = await getOrderTypeId(svc.orderType);
+  const orderTypeId = svc.orderTypeId || (await getOrderTypeId(""));
   if (!orderTypeId) {
     return { ok: false, error: "Запис НЕ створено: не знайдено тип замовлення в CRM. Не підтверджуй дату, запропонуй дзвінок менеджера." };
   }
@@ -1032,7 +1032,18 @@ async function bookSlot(userId, input, source) {
     malfunction: `${svc.title}. Авто: ${carText(input)}${input.comment ? ". " + input.comment : ""}`.slice(0, 500),
     manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.`,
   };
-  const r = await roappPost("/orders", body);
+  const cf = await getCarFieldIds();
+  const customFields = {};
+  customFields[cf.brand] = String(input.brand || "");
+  customFields[cf.model] = String(input.model || "");
+  if (cf.year && input.year) customFields[cf.year] = String(input.year);
+  body.custom_fields = JSON.stringify(customFields);
+
+  let r = await roappPost("/orders", body);
+  if (r.status >= 400 && /custom_fields/.test(r.text)) {
+    // запасний варіант — поля як об'єкт, а не рядок
+    r = await roappPost("/orders", { ...body, custom_fields: customFields });
+  }
   console.log("RO App створення замовлення:", r.status, r.text.slice(0, 1000), JSON.stringify(body));
   if (r.status >= 400) {
     return { ok: false, error: "Запис НЕ створено через помилку CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити зручний час." };
@@ -1084,6 +1095,27 @@ async function findOrCreateClient(name, phone) {
   // Якщо API не повернуло id — шукаємо ще раз за телефоном
   return await findClientByPhone(digits);
 }
+// Користувацькі поля замовлення (марка, модель, рік) — ID беремо з RO App
+let cachedCarFields = null;
+async function getCarFieldIds() {
+  if (cachedCarFields) return cachedCarFields;
+  const ids = { brand: "f1492401", model: "f1492402", year: null }; // запасні значення
+  try {
+    const r = await roappGet("/orders/custom-fields");
+    const list = listFrom(r.body);
+    console.log("RO App поля замовлення:", JSON.stringify(list.map((f) => ({ id: f.id, name: f.name || f.title }))).slice(0, 800));
+    const find = (re) => list.find((f) => re.test(String(f.name || f.title || "").toLowerCase()));
+    const b = find(/марк|brand/), mo = find(/модел|model/), y = find(/рік|год|year/);
+    if (b) ids.brand = "f" + b.id;
+    if (mo) ids.model = "f" + mo.id;
+    if (y) ids.year = "f" + y.id;
+  } catch (e) {
+    console.error("Не вдалося отримати поля замовлення:", e);
+  }
+  cachedCarFields = ids;
+  return ids;
+}
+
 function carText(input) {
   const parts = [input.brand, input.model, input.year].filter(Boolean).join(" ");
   return parts || input.car || "не вказано";
