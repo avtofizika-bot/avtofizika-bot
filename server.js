@@ -707,6 +707,7 @@ const FULL_DAY = [[WORK_START, WORK_END]];
 const BOOKING_SERVICES = {
   tail_lights: {
     title: "Задні ліхтарі (переробка поворотників / ремонт задніх ліхтарів; НЕ світловоди)",
+    crmName: "Задні ліхтарі", // коротка назва для CRM
     masters: [106873],
     slots: [["09:00", "14:00"], ["14:00", "19:00"]], // до 2 авто на день
     box: BOX_SVITLYI,
@@ -715,6 +716,7 @@ const BOOKING_SERVICES = {
   },
   headlight_repair: {
     title: "Ремонт / переупаковка фар, заміна скла, заміна/ремонт світловоду (світловод — це завжди передні фари)",
+    crmName: "Ремонт фари", // коротка назва для CRM
     masters: [277961, 300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
@@ -723,6 +725,7 @@ const BOOKING_SERVICES = {
   },
   headlight_polish_film: {
     title: "Шліфування / полірування фар + плівка на фари",
+    crmName: "Шліфування фар + плівка", // коротка назва для CRM
     masters: [300541],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
@@ -731,6 +734,7 @@ const BOOKING_SERVICES = {
   },
   bi_led: {
     title: "Встановлення Bi-LED / покращення світла",
+    crmName: "Встановлення Bi-LED", // коротка назва для CRM
     masters: [149533],
     slots: FULL_DAY,
     box: BOX_SVITLYI,
@@ -739,6 +743,7 @@ const BOOKING_SERVICES = {
   },
   wash: {
     title: "Мийка",
+    crmName: "Мийка", // коротка назва для CRM
     masters: [302319],
     slots: [["09:00", "12:00"], ["14:00", "17:00"]], // до 2 авто на день
     box: BOX_MOKRYI,
@@ -747,6 +752,7 @@ const BOOKING_SERVICES = {
   },
   detailing: {
     title: "Детейлінг: мийка + хімчистка, полірування кузова, кераміка",
+    crmName: "Детейлінг", // коротка назва для CRM
     masters: [302319],
     slots: FULL_DAY,
     box: BOX_MOKRYI,
@@ -755,6 +761,7 @@ const BOOKING_SERVICES = {
   },
   body_film: {
     title: "Захисна плівка на кузов",
+    crmName: "Плівка на кузов", // коротка назва для CRM
     masters: [321357],
     slots: FULL_DAY,
     box: BOX_TYKHYI,
@@ -1007,6 +1014,9 @@ async function bookSlot(userId, input, source) {
 
   // 1) Клієнт: шукаємо за телефоном, якщо немає — створюємо
   const clientId = await findOrCreateClient(input.name, input.phone);
+  if (clientId === "INVALID_PHONE") {
+    return { ok: false, error: "CRM не прийняла номер телефону як некоректний. Запис ще НЕ створено. Попроси клієнта перевірити номер і написати його ще раз повністю (наприклад, 067 123 45 67), потім знову виклич book_slot з тим самим slot_id." };
+  }
   if (!clientId) {
     return { ok: false, error: "Запис НЕ створено: не вдалося знайти/створити клієнта в CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити час." };
   }
@@ -1029,7 +1039,7 @@ async function bookSlot(userId, input, source) {
     scheduled_for: isoZ(orderStart),
     scheduled_to: isoZ(orderEnd),
     resource_id: svc.box,
-    malfunction: `${svc.title}. Авто: ${carText(input)}${input.comment ? ". " + input.comment : ""}`.slice(0, 500),
+    malfunction: `${svc.crmName || svc.title}. Авто: ${carText(input)}${input.comment ? ". " + input.comment : ""}`.slice(0, 500),
     manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.`,
   };
   const cf = await getCarFieldIds();
@@ -1087,6 +1097,7 @@ async function findOrCreateClient(name, phone) {
   };
   const r = await roappPost("/contacts/people", body);
   console.log("RO App створення клієнта:", r.status, r.text.slice(0, 500));
+  if (r.status === 400 && /phone/i.test(r.text)) return "INVALID_PHONE";
   try {
     const j = JSON.parse(r.text);
     const newId = (j && (j.id || (j.data && j.data.id))) || null;
