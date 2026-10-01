@@ -98,6 +98,31 @@ function pushToHistory(userId, role, content) {
 const leadAlreadySent = new Set();
 
 // ---------------------------------------------------------------------------
+// Журнал за день для агента-контролера: хто писав, які були заявки/записи/помилки.
+// Зберігається в пам'яті (обнуляється при перезапуску сервера).
+// ---------------------------------------------------------------------------
+const dayLog = { date: "", users: new Map(), events: [] };
+function kyivDateStr(d = new Date()) {
+  return d.toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" });
+}
+function ensureDay() {
+  const today = kyivDateStr();
+  if (dayLog.date !== today) {
+    dayLog.date = today;
+    dayLog.users = new Map();
+    dayLog.events = [];
+  }
+}
+function logActivity(userId) {
+  ensureDay();
+  if (!dayLog.users.has(userId)) dayLog.users.set(userId, { first: new Date() });
+}
+function logEvent(type, userId, detail) {
+  ensureDay();
+  dayLog.events.push({ time: new Date(), type, userId, detail: String(detail || "").slice(0, 300) });
+}
+
+// ---------------------------------------------------------------------------
 // Витягає звичайний текст з "content" повідомлення (яке може бути або
 // простим рядком, або масивом блоків текст+зображення) — потрібно для
 // класифікації теми.
@@ -177,6 +202,7 @@ async function classifyTopic(userId, latestUserText) {
 // ---------------------------------------------------------------------------
 async function askClaude(userId, content, source = "chat") {
   pushToHistory(userId, "user", content);
+  logActivity(userId);
 
   const latestUserText = extractPlainText(content);
   const topic = await classifyTopic(userId, latestUserText);
@@ -234,6 +260,8 @@ async function askClaude(userId, content, source = "chat") {
     if (!response.ok) {
       const errText = await response.text();
       console.error("Anthropic API error:", response.status, errText);
+      logEvent("error", userId, `Anthropic API ${response.status}`);
+      alertAdmin(`Anthropic API повернув помилку ${response.status}. Бот не може відповідати клієнтам!\n${errText.slice(0, 300)}`, "anthropic");
       throw new Error(`Anthropic API вернул ошибку ${response.status}`);
     }
 
@@ -340,6 +368,7 @@ async function extractLeadFromConversation(userId) {
 async function sendLeadToCRM(lead, source) {
   if (!isValidPhone(lead.phone)) {
     console.warn("Лід НЕ відправлено — некоректний номер телефону:", lead.phone);
+    logEvent("bad_phone", "", `${lead.name}: ${lead.phone}`);
     return false;
   }
   lead = { ...lead, phone: "+" + normalizePhone(lead.phone) };
@@ -370,7 +399,7 @@ async function sendLeadToCRM(lead, source) {
   const deadlineIso = now.toISOString();
 
   try {
-    await fetch(MAKE_WEBHOOK_URL, {
+    const makeResp = await fetch(MAKE_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -382,9 +411,15 @@ async function sendLeadToCRM(lead, source) {
         source, // "telegram" або "website"
       }),
     });
+    if (!makeResp.ok) {
+      throw new Error(`Make відповів ${makeResp.status}`);
+    }
     console.log("Лід відправлено в CRM:", lead.name, lead.phone, timestamp);
+    logEvent("lead", "", `${lead.name}, ${lead.phone} (${source})`);
   } catch (err) {
     console.error("Помилка відправки ліда в CRM:", err);
+    logEvent("error", "", "Звернення не відправлено в Make: " + err);
+    alertAdmin(`Звернення НЕ потрапило в CRM (Make).\nКлієнт: ${lead.name}, ${lead.phone}\nДжерело: ${source}\nПомилка: ${err}\n\nЗателефонуйте клієнту вручну!`, "lead-" + lead.phone);
   }
 }
 
@@ -436,6 +471,18 @@ app.post("/webhook/telegram", async (req, res) => {
     if (!message) return;
 
     const chatId = message.chat.id;
+
+    // Службові команди
+    const cmd = (message.text || "").trim().toLowerCase();
+    if (cmd === "/myid") {
+      await sendTelegram(chatId, `Ваш chat ID: ${chatId}\nВставте його в Render → Environment як ADMIN_CHAT_ID.`);
+      return;
+    }
+    if (ADMIN_CHAT_ID && String(chatId) === String(ADMIN_CHAT_ID) && ["/status", "/report"].includes(cmd)) {
+      if (cmd === "/status") await sendTelegram(chatId, formatHealth(await runHealthChecks()));
+      if (cmd === "/report") await sendDailyReport(true);
+      return;
+    }
     let contentForClaude;
 
     if (message.photo && message.photo.length > 0) {
@@ -494,6 +541,11 @@ app.post("/webhook/telegram", async (req, res) => {
     );
   } catch (err) {
     console.error("Ошибка обработки Telegram сообщения:", err);
+    alertAdmin(`Помилка обробки повідомлення в Telegram: ${err}`, "tg-error");
+    try {
+      const cid = req.body && req.body.message && req.body.message.chat && req.body.message.chat.id;
+      if (cid) await sendTelegram(cid, "Вибачте, у нас коротка технічна пауза. Напишіть, будь ласка, ще раз за хвилину або зателефонуйте: +38 (067) 802-33-22.");
+    } catch (e) {}
   }
 });
 
@@ -524,6 +576,7 @@ app.post("/api/chat", async (req, res) => {
     res.json({ reply: replyText });
   } catch (err) {
     console.error("Ошибка обработки веб-чата:", err);
+    alertAdmin(`Помилка обробки повідомлення в чаті на сайті: ${err}`, "web-error");
     res.status(500).json({ error: "Внутренняя ошибка сервера" });
   }
 });
@@ -584,6 +637,7 @@ app.post("/webhook/instagram", async (req, res) => {
     );
   } catch (err) {
     console.error("Ошибка обработки Instagram сообщения:", err);
+    alertAdmin(`Помилка обробки повідомлення в Instagram: ${err}`, "ig-error");
   }
 });
 
@@ -1077,6 +1131,12 @@ async function bookSlot(userId, input, source) {
   }
   console.log("RO App створення замовлення:", r.status, r.text.slice(0, 1000), JSON.stringify(body));
   if (r.status >= 400) {
+    logEvent("error", userId, "Замовлення не створено: " + r.text.slice(0, 200));
+    alertAdmin(`Онлайн-запис НЕ створився в RO App.\nКлієнт: ${input.name}, ${input.phone}\nПослуга: ${svc.crmName || svc.title}\nВідповідь RO App: ${r.text.slice(0, 400)}`, "order-" + input.phone);
+  } else {
+    logEvent("order", userId, `${input.name}, ${input.phone} — ${svc.crmName || svc.title}, ${slot.start}`);
+  }
+  if (r.status >= 400) {
     return { ok: false, error: "Запис НЕ створено через помилку CRM. Не називай клієнту дату як підтверджену. Скажи, що заявку передано менеджеру і він зателефонує, щоб узгодити зручний час." };
   }
   delete cache[input.slot_id];
@@ -1121,6 +1181,7 @@ async function sendOrderReminder(data) {
     console.log("Нагадування менеджеру відправлено в Make:", data.order_number, data.manager_name);
   } catch (err) {
     console.error("Помилка відправки нагадування в Make:", err);
+    alertAdmin(`Нагадування менеджеру по замовленню ${data.order_number} не відправлено в Make: ${err}`, "reminder");
   }
 }
 
@@ -1272,9 +1333,231 @@ async function runBookingTool(userId, name, input, source) {
     return { error: "Невідомий інструмент" };
   } catch (err) {
     console.error(`Помилка інструмента ${name}:`, err);
+    logEvent("error", userId, `Інструмент ${name}: ${err}`);
+    alertAdmin(`Помилка онлайн-запису (${name}): ${err}`, "tool-" + name);
     return { error: "Система запису тимчасово недоступна, запис НЕ створено. Не підтверджуй клієнту жодну дату — запропонуй зворотний дзвінок менеджера для узгодження часу." };
   }
 }
+
+// ===========================================================================
+// АГЕНТ-КОНТРОЛЕР
+// 1) Миттєві сигнали в Telegram адміністратору при помилках (заявки, записи, API).
+// 2) Перевірка техніки щогодини (Anthropic, RO App, Telegram webhook, змінні).
+// 3) Щоденний звіт о 19:30 (Київ): статистика + ШІ-розбір якості діалогів.
+// Команди адміністратору в Telegram: /status — перевірка зараз, /report — звіт зараз.
+// Потрібна змінна ADMIN_CHAT_ID (дізнатися: написати боту /myid).
+// ===========================================================================
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";
+const REPORT_TIME = process.env.REPORT_TIME || "19:30"; // за Києвом
+const REVIEW_MODEL = process.env.REVIEW_MODEL || ANTHROPIC_MODEL;
+
+async function sendTelegram(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  // Telegram обмежує повідомлення ~4096 символами — ділимо на частини
+  const parts = [];
+  let rest = String(text || "");
+  while (rest.length > 0) {
+    parts.push(rest.slice(0, 3900));
+    rest = rest.slice(3900);
+  }
+  for (const part of parts) {
+    try {
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: part, disable_web_page_preview: true }),
+      });
+    } catch (err) {
+      console.error("Помилка надсилання в Telegram:", err);
+    }
+  }
+}
+
+// Не спамимо: однаковий сигнал не частіше ніж раз на 30 хв
+const lastAlerts = new Map();
+function alertAdmin(text, key = text) {
+  const now = Date.now();
+  if (lastAlerts.has(key) && now - lastAlerts.get(key) < 30 * 60 * 1000) return;
+  lastAlerts.set(key, now);
+  console.warn("[ALERT]", text);
+  if (ADMIN_CHAT_ID) sendTelegram(ADMIN_CHAT_ID, "⚠️ AvtoFizika бот\n" + text);
+}
+
+// ---------- Перевірка техніки ----------
+async function runHealthChecks() {
+  const checks = [];
+  const add = (name, ok, info = "") => checks.push({ name, ok, info });
+
+  // 1. Змінні оточення
+  const envs = ["ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN", "MAKE_WEBHOOK_URL", "ROAPP_API_KEY", "MAKE_ORDER_WEBHOOK_URL", "ADMIN_CHAT_ID"];
+  const missing = envs.filter((e) => !process.env[e]);
+  add("Змінні Render Environment", missing.length === 0, missing.length ? "не задано: " + missing.join(", ") : "усі на місці");
+
+  // 2. Anthropic API (мінімальний запит)
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: CLASSIFIER_MODEL, max_tokens: 5, messages: [{ role: "user", content: "ok" }] }),
+    });
+    add("Anthropic API (мозок бота)", r.ok, r.ok ? "працює" : `помилка ${r.status}: ${(await r.text()).slice(0, 150)}`);
+  } catch (e) {
+    add("Anthropic API (мозок бота)", false, String(e));
+  }
+
+  // 3. Telegram webhook
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+    const j = await r.json();
+    const w = j.result || {};
+    const urlOk = (w.url || "").includes("/webhook/telegram");
+    const recentErr = w.last_error_date && Date.now() / 1000 - w.last_error_date < 3600;
+    add(
+      "Telegram webhook",
+      urlOk && !recentErr,
+      !urlOk ? "webhook не встановлено!" :
+      recentErr ? `остання помилка: ${w.last_error_message}` :
+      `ok, у черзі: ${w.pending_update_count || 0}`
+    );
+  } catch (e) {
+    add("Telegram webhook", false, String(e));
+  }
+
+  // 4. RO App API
+  if (ROAPP_API_KEY) {
+    try {
+      const r = await roappGet("/company/locations");
+      add("RO App API (CRM)", r.status === 200, r.status === 200 ? "працює" : `помилка ${r.status}`);
+    } catch (e) {
+      add("RO App API (CRM)", false, String(e));
+    }
+    // 5. Пошук вільних вікон
+    if (BOOKING_ENABLED) {
+      try {
+        const res = await findFreeSlots("healthcheck", "wash", 1);
+        add("Онлайн-запис (пошук вікон)", !res.error, res.error ? res.error : `знайдено вікон: ${res.slots.length}`);
+      } catch (e) {
+        add("Онлайн-запис (пошук вікон)", false, String(e));
+      }
+    }
+  }
+  return checks;
+}
+
+function formatHealth(checks) {
+  const allOk = checks.every((c) => c.ok);
+  return (
+    (allOk ? "✅ Усе працює" : "❌ Є проблеми") + "\n\n" +
+    checks.map((c) => `${c.ok ? "✅" : "❌"} ${c.name} — ${c.info}`).join("\n")
+  );
+}
+
+async function periodicHealthCheck() {
+  try {
+    const checks = await runHealthChecks();
+    const bad = checks.filter((c) => !c.ok && c.name !== "Змінні Render Environment");
+    if (bad.length) alertAdmin("Перевірка техніки виявила проблеми:\n" + formatHealth(checks), "health");
+  } catch (e) {
+    console.error("Помилка перевірки техніки:", e);
+  }
+}
+
+// ---------- Щоденний звіт ----------
+let lastReportDate = "";
+
+async function reviewDialogsWithAI(transcripts) {
+  if (!transcripts.length) return "Діалогів сьогодні не було.";
+  const text = transcripts.join("\n\n=====\n\n").slice(0, 60000);
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: REVIEW_MODEL,
+        max_tokens: 1500,
+        system:
+          "Ти — контролер якості чат-бота автосервісу AvtoFizika (ремонт фар, задні ліхтарі, детейлінг, захисна плівка, Київ). " +
+          "Прочитай діалоги бота з клієнтами за день і склади короткий звіт для власника українською мовою (без markdown-зірочок). Перевір:\n" +
+          "1) Помилки бота: неправильні або вигадані ціни/дати, обіцянки, яких бот не може виконати, дивні чи грубі відповіді.\n" +
+          "2) Втрачені клієнти: клієнт цікавився, але не залишив контакт / не записався — чому і що можна покращити.\n" +
+          "3) Чи пропонував бот детейлінг і захисну плівку (пріоритетні напрямки), чи робив доречний крос-продаж.\n" +
+          "4) Чи збирав ім'я, телефон, марку/модель/рік перед записом.\n" +
+          "5) 1–3 конкретні рекомендації, що змінити в інструкціях бота.\n" +
+          "Для кожної проблеми вкажи номер діалогу. Якщо все добре — так і напиши коротко. Максимум 25 рядків.",
+        messages: [{ role: "user", content: text }],
+      }),
+    });
+    if (!r.ok) return `Не вдалося зробити ШІ-розбір (помилка ${r.status}).`;
+    const j = await r.json();
+    return j.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  } catch (e) {
+    return "Не вдалося зробити ШІ-розбір: " + e;
+  }
+}
+
+async function sendDailyReport(manual = false) {
+  ensureDay();
+  if (!ADMIN_CHAT_ID) return;
+  const users = [...dayLog.users.keys()].filter((u) => u !== "healthcheck");
+  const count = (t) => dayLog.events.filter((e) => e.type === t).length;
+  const bySource = {};
+  users.forEach((u) => {
+    const src = u.split(":")[0];
+    bySource[src] = (bySource[src] || 0) + 1;
+  });
+
+  const transcripts = users.map((u, i) => {
+    const hist = getHistory(u)
+      .map((m) => `${m.role === "user" ? "Клієнт" : "Бот"}: ${extractPlainText(m.content)}`)
+      .join("\n");
+    return `Діалог №${i + 1} (${u.split(":")[0]}):\n${hist}`;
+  });
+
+  const errors = dayLog.events.filter((e) => e.type === "error");
+  const checks = await runHealthChecks();
+  const review = await reviewDialogsWithAI(transcripts);
+
+  const report =
+    `📊 Звіт AvtoFizika бота за ${dayLog.date}${manual ? " (на запит)" : ""}\n\n` +
+    `Діалогів: ${users.length} (${Object.entries(bySource).map(([k, v]) => `${k}: ${v}`).join(", ") || "—"})\n` +
+    `Звернень у CRM: ${count("lead")}\n` +
+    `Онлайн-записів (замовлень): ${count("order")}\n` +
+    `Некоректних номерів: ${count("bad_phone")}\n` +
+    `Помилок: ${errors.length}` +
+    (errors.length ? "\n" + errors.slice(-5).map((e) => "• " + e.detail).join("\n") : "") +
+    `\n\n🔧 Техніка:\n${formatHealth(checks)}` +
+    `\n\n🧠 Розбір діалогів:\n${review}`;
+
+  await sendTelegram(ADMIN_CHAT_ID, report);
+}
+
+// Планувальник: щогодини — перевірка техніки; щодня у REPORT_TIME — звіт.
+setInterval(() => {
+  const now = new Date();
+  const hhmm = now.toLocaleTimeString("uk-UA", { timeZone: "Europe/Kyiv", hour: "2-digit", minute: "2-digit" });
+  const today = kyivDateStr(now);
+  if (hhmm >= REPORT_TIME && lastReportDate !== today) {
+    lastReportDate = today;
+    sendDailyReport(false);
+  }
+}, 5 * 60 * 1000);
+setInterval(periodicHealthCheck, 60 * 60 * 1000);
+
+// Сторінка перевірки для "будильника" (UptimeRobot): показує статус техніки
+app.get("/api/health", async (req, res) => {
+  if (!process.env.ROAPP_DEBUG_SECRET || req.query.secret !== process.env.ROAPP_DEBUG_SECRET) {
+    return res.send("ok"); // без пароля — просто "живий"
+  }
+  const checks = await runHealthChecks();
+  res.status(checks.every((c) => c.ok) ? 200 : 500).json(checks);
+});
+
+// Якщо сервер перезапустився ввечері після часу звіту — не шлемо порожній звіт одразу
+(() => {
+  const now = new Date();
+  const hhmm = now.toLocaleTimeString("uk-UA", { timeZone: "Europe/Kyiv", hour: "2-digit", minute: "2-digit" });
+  if (hhmm >= REPORT_TIME) lastReportDate = kyivDateStr(now);
+})();
 
 app.listen(PORT, () => {
   console.log(`AvtoFizika bot server запущен на порту ${PORT}`);
