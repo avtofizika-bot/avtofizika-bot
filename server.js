@@ -1452,7 +1452,34 @@ function formatHealth(checks) {
   );
 }
 
+// Самовідновлення: якщо Telegram webhook злетів — встановлюємо його заново
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "https://avtofizika-bot.onrender.com").replace(/\/$/, "");
+async function ensureTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const want = `${PUBLIC_URL}/webhook/telegram`;
+  try {
+    const info = await (await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo`)).json();
+    if (!info.ok) {
+      console.error("Telegram getWebhookInfo помилка:", JSON.stringify(info));
+      alertAdmin("Telegram не приймає токен бота (TELEGRAM_BOT_TOKEN). Можливо, токен змінили в BotFather — оновіть його в Render.", "tg-token");
+      return;
+    }
+    const cur = (info.result && info.result.url) || "";
+    if (cur !== want) {
+      const r = await (await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(want)}`
+      )).json();
+      console.log("Telegram webhook було:", cur || "(порожньо)", "→ встановлено:", want, JSON.stringify(r));
+      alertAdmin(`Telegram webhook був ${cur ? "неправильний" : "не встановлений"} — бот відновив його автоматично (${r.ok ? "успішно" : "помилка: " + r.description}).`, "tg-webhook");
+    }
+  } catch (err) {
+    console.error("Помилка перевірки Telegram webhook:", err);
+  }
+}
+setTimeout(ensureTelegramWebhook, 5000); // при старті сервера
+
 async function periodicHealthCheck() {
+  await ensureTelegramWebhook();
   try {
     const checks = await runHealthChecks();
     const bad = checks.filter((c) => !c.ok && c.name !== "Змінні Render Environment");
