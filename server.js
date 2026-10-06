@@ -98,6 +98,48 @@ function pushToHistory(userId, role, content) {
 const leadAlreadySent = new Set();
 
 // ---------------------------------------------------------------------------
+// Звернення АБО Замовлення, але не обидва.
+// Якщо бот уже запропонував клієнту вікна для онлайн-запису — Звернення
+// відкладаємо: якщо клієнт запишеться (створиться Замовлення) — Звернення
+// не створюємо взагалі; якщо за LEAD_DELAY_MIN хвилин після останнього
+// повідомлення запис не відбувся — відправляємо Звернення (заявку на дзвінок).
+// Якщо вікна не пропонувались — Звернення відправляється одразу, як і раніше.
+// ---------------------------------------------------------------------------
+const LEAD_DELAY_MIN = Number(process.env.LEAD_DELAY_MIN || 10);
+const pendingLeads = new Map(); // userId -> { lead, source, timer }
+
+function handleLead(userId, lead, source) {
+  if (leadAlreadySent.has(userId)) return;
+  const offered = typeof offeredSlots !== "undefined" && offeredSlots.get(userId);
+  const inBookingFlow = offered && Object.keys(offered).length > 0;
+  if (!inBookingFlow) {
+    leadAlreadySent.add(userId);
+    sendLeadToCRM(lead, source);
+    return;
+  }
+  // Клієнт у процесі онлайн-запису — чекаємо
+  const prev = pendingLeads.get(userId);
+  if (prev) clearTimeout(prev.timer);
+  const timer = setTimeout(() => {
+    pendingLeads.delete(userId);
+    if (leadAlreadySent.has(userId)) return; // уже записався онлайн
+    leadAlreadySent.add(userId);
+    console.log(`[${userId}] онлайн-запис не завершено за ${LEAD_DELAY_MIN} хв — відправляю Звернення`);
+    sendLeadToCRM(lead, source);
+  }, LEAD_DELAY_MIN * 60 * 1000);
+  pendingLeads.set(userId, { lead, source, timer });
+  console.log(`[${userId}] Звернення відкладено (клієнт обирає вікно для онлайн-запису)`);
+}
+function cancelPendingLead(userId) {
+  const p = pendingLeads.get(userId);
+  if (p) {
+    clearTimeout(p.timer);
+    pendingLeads.delete(userId);
+    console.log(`[${userId}] Звернення скасовано — створено Замовлення`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Журнал за день для агента-контролера: хто писав, які були заявки/записи/помилки.
 // Зберігається в пам'яті (обнуляється при перезапуску сервера).
 // ---------------------------------------------------------------------------
@@ -523,8 +565,7 @@ app.post("/webhook/telegram", async (req, res) => {
     if (!leadAlreadySent.has(telegramUserId)) {
       const lead = await extractLeadFromConversation(telegramUserId);
       if (lead && isValidPhone(lead.phone)) {
-        leadAlreadySent.add(telegramUserId);
-        sendLeadToCRM(lead, "telegram");
+        handleLead(telegramUserId, lead, "telegram");
       }
     }
 
@@ -568,8 +609,7 @@ app.post("/api/chat", async (req, res) => {
     if (!leadAlreadySent.has(siteUserId)) {
       const lead = await extractLeadFromConversation(siteUserId);
       if (lead && isValidPhone(lead.phone)) {
-        leadAlreadySent.add(siteUserId);
-        sendLeadToCRM(lead, "website");
+        handleLead(siteUserId, lead, "website");
       }
     }
 
@@ -619,8 +659,7 @@ app.post("/webhook/instagram", async (req, res) => {
     if (!leadAlreadySent.has(instagramUserId)) {
       const lead = await extractLeadFromConversation(instagramUserId);
       if (lead && isValidPhone(lead.phone)) {
-        leadAlreadySent.add(instagramUserId);
-        sendLeadToCRM(lead, "instagram");
+        handleLead(instagramUserId, lead, "instagram");
       }
     }
 
@@ -886,6 +925,17 @@ function bookingAssigneeIds(b) {
   if (b.employee && b.employee.id) ids.push(Number(b.employee.id));
   return ids;
 }
+// Вихідний / відпустка майстра: менеджер ставить у RO App Запис (або Замовлення)
+// на майстра з коментарем "Вихідний", "Відпустка", "Лікарняний" тощо.
+// Такий день (або кілька днів) бот вважає повністю зайнятим.
+const DAY_OFF_RE = /вихідн|выходн|відпуст|отпуск|лікарнян|больничн|day\s*off|vacation/i;
+function isDayOffRecord(b) {
+  const text = [b.comment, b.title, b.name, b.description, b.malfunction, b.manager_notes, b.engineer_notes]
+    .filter(Boolean)
+    .map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+    .join(" ");
+  return DAY_OFF_RE.test(text);
+}
 function bookingIsCancelled(b) {
   const s = JSON.stringify(b.status || "").toLowerCase();
   return s.includes("скас") || s.includes("отмен") || s.includes("cancel") || s.includes("відмов") || s.includes("отказ");
@@ -908,13 +958,17 @@ async function fetchBookings(from, to) {
   }
   return all
     .filter((b) => !bookingIsCancelled(b))
-    .map((b) => ({
-      start: pickDate(b.scheduled_for || b.start || b.starts_at),
-      end: pickDate(b.scheduled_to || b.end || b.ends_at),
-      assignees: bookingAssigneeIds(b),
-      source: "booking",
-      id: b.id,
-    }))
+    .map((b) => {
+      const dayOff = isDayOffRecord(b);
+      let start = pickDate(b.scheduled_for || b.start || b.starts_at);
+      let end = pickDate(b.scheduled_to || b.end || b.ends_at);
+      if (start && dayOff) {
+        // вихідний займає цілий день (або всі дні до дати закінчення)
+        start = startOfWorkday(start);
+        end = endOfWorkday(end && end > start ? end : start);
+      }
+      return { start, end, assignees: bookingAssigneeIds(b), source: dayOff ? "day_off" : "booking", dayOff, id: b.id };
+    })
     .filter((b) => b.start);
 }
 
@@ -968,7 +1022,9 @@ async function fetchOrders(from, to) {
     if (!start && !end) continue;
     if (!start) { start = startOfWorkday(end); end = endOfWorkday(end); }
     if (!end || end <= start) end = endOfWorkday(start);
-    res.push({ start, end, assignees: orderAssigneeIds(o), source: "order", id: o.id });
+    const dayOff = isDayOffRecord(o);
+    if (dayOff) { start = startOfWorkday(start); end = endOfWorkday(end > start ? end : start); }
+    res.push({ start, end, assignees: orderAssigneeIds(o), source: dayOff ? "day_off" : "order", dayOff, id: o.id });
   }
   return res;
 }
@@ -995,7 +1051,7 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
 
   const now = new Date();
   const until = new Date(now.getTime() + BOOKING_DAYS_AHEAD * 24 * 3600 * 1000);
-  const bookings = await fetchBusy(new Date(now.getTime() - 7 * 24 * 3600 * 1000), until);
+  const bookings = await fetchBusy(new Date(now.getTime() - 31 * 24 * 3600 * 1000), until);
 
   const result = [];
   const cache = {};
@@ -1012,6 +1068,7 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
       const jobs = bookings.filter(
         (b) => b.assignees.includes(Number(mId)) && b.start < dayEnd && (b.end || b.start) > dayStart
       );
+      if (jobs.some((b) => b.dayOff)) continue; // у майстра вихідний цього дня
       const cap = svc.capacity || svc.slots.length;
       if (jobs.length >= cap) continue; // день у майстра заповнений
       if (svc.capacity) { chosen = { mId, idx: 0 }; break; } // лише ліміт авто на день, час не важливий
@@ -1072,7 +1129,7 @@ async function bookSlot(userId, input, source) {
   // Перевіряємо ще раз, чи вікно досі вільне
   const start = new Date(slot.start);
   const end = new Date(slot.end);
-  const bookings = await fetchBusy(new Date(start.getTime() - 7 * 24 * 3600 * 1000), new Date(end.getTime() + 3600 * 1000));
+  const bookings = await fetchBusy(new Date(start.getTime() - 31 * 24 * 3600 * 1000), new Date(end.getTime() + 3600 * 1000));
   const svcDef = BOOKING_SERVICES[slot.serviceKey];
   const svcCap = svcDef.capacity || svcDef.slots.length;
   const sp = kyivParts(start);
@@ -1081,6 +1138,9 @@ async function bookSlot(userId, input, source) {
   const dayJobs = bookings.filter(
     (b) => b.assignees.includes(Number(slot.masterId)) && b.start < dE && (b.end || b.start) > dS
   );
+  if (dayJobs.some((b) => b.dayOff)) {
+    return { ok: false, error: "У майстра цього дня вихідний. Виклич find_free_slots ще раз і запропонуй інші варіанти." };
+  }
   if (dayJobs.length >= svcCap || (!svcDef.capacity && masterBusy(dayJobs, slot.masterId, start, end))) {
     return { ok: false, error: "Це вікно вже зайняли. Виклич find_free_slots ще раз і запропонуй інші варіанти." };
   }
@@ -1143,6 +1203,7 @@ async function bookSlot(userId, input, source) {
 
   // Клієнт уже записаний у Замовлення — окреме Звернення не створюємо (щоб не дублювати)
   leadAlreadySent.add(userId);
+  cancelPendingLead(userId);
 
   // Нагадування менеджеру (завдання в RO App через Make)
   let order = {};
