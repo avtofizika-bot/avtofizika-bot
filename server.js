@@ -810,10 +810,20 @@ const MANAGER_ANDRII = 182452; // Андрей П
 
 // slots — вікна протягом дня [початок, кінець]. Повний день = одне вікно 09:00–19:00.
 const FULL_DAY = [[WORK_START, WORK_END]];
+// Приводимо опис роботи до стандартних назв для CRM (за правилами послуги)
+function crmComment(svc, comment) {
+  let c = String(comment || "").trim();
+  for (const [re, repl] of svc.commentRules || []) c = c.replace(re, repl);
+  return c.replace(/\s+/g, " ").trim();
+}
+
 const BOOKING_SERVICES = {
   tail_lights: {
     title: "Задні ліхтарі (переробка поворотників / ремонт задніх ліхтарів; НЕ світловоди)",
     crmName: "Задні ліхтарі", // коротка назва для CRM
+    // Як називати роботу в CRM: будь-який опис про заміну червоних поворотників на жовті
+    // замінюємо на стандартну назву "Переробка задніх ліхтарів"
+    commentRules: [[/(замін\w*|переробк\w*|переделк\w*|замен\w*)?[^.;]*червон\w*[^.;]*жовт\w*[^.;]*|[^.;]*поворотник\w*[^.;]*/i, "Переробка задніх ліхтарів"]],
     masters: [106873],
     slots: [["09:00", "10:00"]], // клієнт приїжджає зранку 9:00–10:00
     capacity: 2, // до 2 авто на день, незалежно від часу
@@ -1174,7 +1184,7 @@ async function bookSlot(userId, input, source) {
     scheduled_for: isoZ(orderStart),
     scheduled_to: isoZ(orderEnd),
     resource_id: svc.box,
-    malfunction: `${svc.crmName || svc.title}. Авто: ${carText(input)}${input.comment ? ". " + input.comment : ""}`.slice(0, 500),
+    malfunction: `${svc.crmName || svc.title}. Авто: ${carText(input)}${input.comment ? ". " + crmComment(svc, input.comment) : ""}`.slice(0, 500),
     manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.`,
   };
   const cf = await getCarFieldIds();
