@@ -1702,6 +1702,130 @@ app.get("/api/health", async (req, res) => {
   if (hhmm >= REPORT_TIME) lastReportDate = kyivDateStr(now);
 })();
 
+// ---------------------------------------------------------------------------
+// ЮРИДИЧНІ СТОРІНКИ ДЛЯ META (Instagram / Facebook App Review)
+// /privacy        — Політика конфіденційності (UA + EN)
+// /data-deletion  — Інструкція з видалення даних (UA + EN)
+// /terms          — Умови використання (UA + EN)
+// Ці посилання вставляються в Meta → Налаштування додатка → Основне.
+// ---------------------------------------------------------------------------
+const LEGAL_UPDATED = "15.10.2026";
+function legalPage(title, body) {
+  return `<!doctype html><html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title} — AvtoFizika</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:820px;margin:0 auto;padding:24px 16px 64px;line-height:1.6;color:#1d1d1f;background:#fff}
+h1{font-size:28px;margin-bottom:4px}h2{font-size:20px;margin-top:32px}h3{font-size:17px;margin-top:22px}
+.muted{color:#6e6e73;font-size:14px}hr{border:0;border-top:1px solid #e5e5ea;margin:40px 0}
+a{color:#0a66c2}ul{padding-left:22px}
+</style></head><body>${body}</body></html>`;
+}
+const CONTACTS_UA = `AvtoFizika, м. Київ, проспект Відрадний, 107. Телефон: +38 (067) 802-33-22. Email: <a href="mailto:service@avtofizika.com.ua">service@avtofizika.com.ua</a>. Сайт: <a href="https://avtofizika.com.ua">avtofizika.com.ua</a>`;
+const CONTACTS_EN = `AvtoFizika, 107 Vidradnyi Ave, Kyiv, Ukraine. Phone: +38 (067) 802-33-22. Email: <a href="mailto:service@avtofizika.com.ua">service@avtofizika.com.ua</a>. Website: <a href="https://avtofizika.com.ua">avtofizika.com.ua</a>`;
+
+app.get("/privacy", (req, res) => {
+  res.send(legalPage("Політика конфіденційності / Privacy Policy", `
+<h1>Політика конфіденційності</h1>
+<p class="muted">Оновлено: ${LEGAL_UPDATED}</p>
+<p>Ця політика пояснює, як AvtoFizika (автосервіс з ремонту та тюнінгу автомобільної оптики й детейлінгу, Київ) обробляє дані, коли ви пишете нам у Instagram Direct, Telegram або в чат на сайті avtofizika.com.ua. На ваші повідомлення відповідає автоматизований чат-асистент на основі штучного інтелекту; за потреби до розмови підключається менеджер.</p>
+<h2>Які дані ми отримуємо</h2>
+<ul>
+<li>Ідентифікатор вашого акаунта в Instagram / Telegram (технічний ID, який надає платформа) та текст повідомлень, які ви нам надсилаєте.</li>
+<li>Дані, які ви самі повідомляєте в розмові: ім'я, номер телефону, марка, модель і рік авто, опис проблеми чи бажаної послуги.</li>
+</ul>
+<p>Ми не запитуємо і не обробляємо паролі, платіжні дані чи інші чутливі дані.</p>
+<h2>Для чого ми використовуємо дані</h2>
+<ul>
+<li>щоб відповісти на ваше запитання, проконсультувати щодо послуг і цін;</li>
+<li>щоб записати вас на сервіс або передати заявку менеджеру для зворотного дзвінка;</li>
+<li>щоб контролювати якість роботи чат-асистента.</li>
+</ul>
+<p>Ми не продаємо ваші дані, не використовуємо їх для реклами і не передаємо третім особам для їхнього маркетингу.</p>
+<h2>Кому передаються дані (обробники)</h2>
+<ul>
+<li>Meta Platforms (Instagram) і Telegram — доставка повідомлень;</li>
+<li>Anthropic — генерація відповідей чат-асистента (текст розмови обробляється для формування відповіді);</li>
+<li>RO App (RemOnline) та Make.com — облік заявок і записів у нашій CRM;</li>
+<li>Render — хостинг сервера чат-асистента.</li>
+</ul>
+<h2>Як довго зберігаються дані</h2>
+<p>Історія розмови зберігається на сервері чат-асистента тимчасово (до перезапуску сервера, зазвичай не довше кількох діб). Заявки й записи (ім'я, телефон, авто, суть звернення) зберігаються в CRM стільки, скільки потрібно для надання послуг і гарантійного обслуговування, або до вашого запиту на видалення.</p>
+<h2>Ваші права</h2>
+<p>Ви можете в будь-який момент попросити надати, виправити або видалити ваші дані. Як це зробити — на сторінці <a href="/data-deletion">Видалення даних</a>.</p>
+<h2>Контакти</h2>
+<p>${CONTACTS_UA}</p>
+<hr>
+<h1>Privacy Policy</h1>
+<p class="muted">Last updated: ${LEGAL_UPDATED}</p>
+<p>This policy explains how AvtoFizika (a car headlight repair, tuning and detailing service in Kyiv, Ukraine) processes data when you message us via Instagram Direct, Telegram or the chat on avtofizika.com.ua. Your messages are answered by an automated AI chat assistant; a human manager joins when needed.</p>
+<h2>Data we receive</h2>
+<ul>
+<li>Your Instagram / Telegram account identifier (the technical ID provided by the platform) and the text of the messages you send us.</li>
+<li>Information you choose to share in the conversation: name, phone number, car make, model and year, and a description of the issue or requested service.</li>
+</ul>
+<p>We do not request or process passwords, payment details or other sensitive data.</p>
+<h2>How we use the data</h2>
+<ul>
+<li>to answer your questions and advise on services and prices;</li>
+<li>to book you an appointment or pass your request to a manager for a call back;</li>
+<li>to monitor the quality of the chat assistant.</li>
+</ul>
+<p>We do not sell your data, use it for advertising, or share it with third parties for their marketing.</p>
+<h2>Service providers (processors)</h2>
+<ul>
+<li>Meta Platforms (Instagram) and Telegram — message delivery;</li>
+<li>Anthropic — generating the assistant's replies (conversation text is processed to produce a response);</li>
+<li>RO App (RemOnline) and Make.com — managing requests and appointments in our CRM;</li>
+<li>Render — hosting of the chat assistant server.</li>
+</ul>
+<h2>Retention</h2>
+<p>Conversation history is kept on the assistant server temporarily (until the server restarts, usually no longer than a few days). Requests and appointments (name, phone, car, request details) are kept in our CRM as long as needed to provide the service and warranty support, or until you ask us to delete them.</p>
+<h2>Your rights</h2>
+<p>You can ask us at any time to access, correct or delete your data. See <a href="/data-deletion">Data Deletion</a> for instructions.</p>
+<h2>Contact</h2>
+<p>${CONTACTS_EN}</p>
+`));
+});
+
+app.get("/data-deletion", (req, res) => {
+  res.send(legalPage("Видалення даних / Data Deletion", `
+<h1>Видалення даних</h1>
+<p class="muted">Оновлено: ${LEGAL_UPDATED}</p>
+<p>Щоб видалити дані, які ви надали AvtoFizika через Instagram, Telegram або чат на сайті:</p>
+<ol>
+<li>Напишіть нам на <a href="mailto:service@avtofizika.com.ua">service@avtofizika.com.ua</a> або в Instagram Direct повідомлення «Видаліть мої дані».</li>
+<li>Вкажіть ваше ім'я в Instagram (або номер телефону, який ви залишали), щоб ми знайшли ваші записи.</li>
+<li>Ми видалимо історію розмови та ваші контактні дані з нашої CRM протягом 30 днів і підтвердимо видалення у відповідь.</li>
+</ol>
+<p>Також ви можете в будь-який момент видалити переписку зі свого боку в Instagram і відключити доступ додатків у налаштуваннях Instagram / Facebook (Налаштування → Безпека → Додатки та сайти).</p>
+<p>${CONTACTS_UA}</p>
+<hr>
+<h1>Data Deletion Instructions</h1>
+<p class="muted">Last updated: ${LEGAL_UPDATED}</p>
+<p>To delete the data you provided to AvtoFizika via Instagram, Telegram or our website chat:</p>
+<ol>
+<li>Email <a href="mailto:service@avtofizika.com.ua">service@avtofizika.com.ua</a> or send us an Instagram Direct message saying "Delete my data".</li>
+<li>Include your Instagram username (or the phone number you shared) so we can find your records.</li>
+<li>We will delete the conversation history and your contact details from our CRM within 30 days and confirm the deletion in reply.</li>
+</ol>
+<p>You can also delete the conversation on your side in Instagram at any time and remove app access in your Instagram / Facebook settings (Settings → Security → Apps and websites).</p>
+<p>${CONTACTS_EN}</p>
+`));
+});
+
+app.get("/terms", (req, res) => {
+  res.send(legalPage("Умови використання / Terms of Service", `
+<h1>Умови використання чат-асистента</h1>
+<p class="muted">Оновлено: ${LEGAL_UPDATED}</p>
+<p>Чат-асистент AvtoFizika у Instagram, Telegram і на сайті надає довідкову інформацію про послуги та орієнтовні ціни і допомагає записатися на сервіс. Остаточна вартість і терміни робіт визначаються після огляду авто майстром. Відповіді генеруються штучним інтелектом і можуть містити неточності — у разі сумнівів уточнюйте у менеджера за телефоном +38 (067) 802-33-22. Обробка даних — згідно з <a href="/privacy">Політикою конфіденційності</a>.</p>
+<hr>
+<h1>Chat Assistant Terms of Service</h1>
+<p class="muted">Last updated: ${LEGAL_UPDATED}</p>
+<p>The AvtoFizika chat assistant on Instagram, Telegram and our website provides general information about our services and estimated prices and helps you book an appointment. Final price and timing are determined after a technician inspects the car. Replies are generated by AI and may contain inaccuracies — if in doubt, please contact a manager at +38 (067) 802-33-22. Data is processed according to our <a href="/privacy">Privacy Policy</a>.</p>
+`));
+});
+
 app.listen(PORT, () => {
   console.log(`AvtoFizika bot server запущен на порту ${PORT}`);
 });
