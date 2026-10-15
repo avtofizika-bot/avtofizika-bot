@@ -641,6 +641,44 @@ app.get("/webhook/instagram", (req, res) => {
   }
 });
 
+// Надсилання відповіді в Instagram Direct.
+// Instagram не показує **жирний** markdown і обмежує повідомлення 1000 символами — ділимо на частини.
+async function sendInstagram(recipientId, text) {
+  const token = process.env.INSTAGRAM_PAGE_ACCESS_TOKEN;
+  if (!token) {
+    alertAdmin("Instagram: не задано INSTAGRAM_PAGE_ACCESS_TOKEN у Render — бот не може відповідати в Direct.", "ig-token");
+    return;
+  }
+  const clean = String(text || "").replace(/\*\*/g, "").replace(/(^|\s)\*(\S)/g, "$1$2");
+  const parts = [];
+  let rest = clean.trim();
+  while (rest.length > 0) {
+    let cut = rest.length > 950 ? rest.lastIndexOf("\n", 950) : rest.length;
+    if (cut < 300) cut = Math.min(950, rest.length);
+    parts.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  for (const part of parts) {
+    const r = await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipient: { id: recipientId }, message: { text: part } }),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      console.error("Instagram: помилка надсилання", r.status, body);
+      const expired = /"code":\s*190/.test(body);
+      alertAdmin(
+        expired
+          ? "Instagram: токен сторінки недійсний або протермінований (помилка 190). Потрібно створити новий постійний токен і замінити INSTAGRAM_PAGE_ACCESS_TOKEN у Render."
+          : `Instagram: не вдалося надіслати відповідь клієнту (помилка ${r.status}): ${body.slice(0, 200)}`,
+        "ig-send"
+      );
+      return;
+    }
+  }
+}
+
 app.post("/webhook/instagram", async (req, res) => {
   console.log("INSTAGRAM WEBHOOK ПОЛУЧЕНО:", JSON.stringify(req.body));
   res.sendStatus(200);
@@ -663,17 +701,7 @@ app.post("/webhook/instagram", async (req, res) => {
       }
     }
 
-    await fetch(
-      `https://graph.facebook.com/v19.0/me/messages?access_token=${process.env.INSTAGRAM_PAGE_ACCESS_TOKEN}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipient: { id: senderId },
-          message: { text: replyText },
-        }),
-      }
-    );
+    await sendInstagram(senderId, replyText);
   } catch (err) {
     console.error("Ошибка обработки Instagram сообщения:", err);
     alertAdmin(`Помилка обробки повідомлення в Instagram: ${err}`, "ig-error");
@@ -1492,6 +1520,23 @@ async function runHealthChecks() {
     );
   } catch (e) {
     add("Telegram webhook", false, String(e));
+  }
+
+  // 3b. Instagram (токен сторінки) — перевіряємо, лише якщо Instagram підключено
+  if (process.env.INSTAGRAM_PAGE_ACCESS_TOKEN) {
+    try {
+      const r = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name&access_token=${process.env.INSTAGRAM_PAGE_ACCESS_TOKEN}`);
+      const j = await r.json();
+      add(
+        "Instagram (токен сторінки)",
+        r.ok && !!j.id,
+        r.ok ? `працює (${j.name || j.id})` :
+        j.error?.code === 190 ? "токен протермінований — потрібен новий постійний токен" :
+        `помилка ${r.status}: ${(j.error?.message || "").slice(0, 120)}`
+      );
+    } catch (e) {
+      add("Instagram (токен сторінки)", false, String(e));
+    }
   }
 
   // 4. RO App API
