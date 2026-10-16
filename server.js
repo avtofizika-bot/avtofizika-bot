@@ -451,6 +451,7 @@ async function sendLeadToCRM(lead, source) {
         timestamp, // людський формат — для відображення в тексті
         deadline: deadlineIso, // ISO-формат — для поля "Кінцевий термін"
         source, // "telegram" або "website"
+        source_label: { instagram: "Instagram", telegram: "Telegram", website: "Сайт заявки" }[source] || source, // для поля "Рекламна кампанія" в Make
       }),
     });
     if (!makeResp.ok) {
@@ -772,6 +773,7 @@ app.get("/api/roapp-check", async (req, res) => {
       `/bookings?sort=scheduled_for&scheduled_for=${f}&scheduled_for=${t}`
     );
 
+    result.ad_campaigns = await getAdCampaigns();
     result.order_types = await roappGet("/orders/types");
     result.order_custom_fields = await roappGet("/orders/custom-fields");
     result.orders_scheduled = await roappGet(
@@ -1156,6 +1158,52 @@ async function roappPost(path, body) {
   return { status: resp.status, text };
 }
 
+// ---------------------------------------------------------------------------
+// РЕКЛАМНА КАМПАНІЯ (джерело клієнта) у замовленні RO App
+// Instagram → кампанія з "Instagram/Інстаграм" у назві, Telegram → "Telegram/Телеграм",
+// сайт → "Сайт заявки". Можна задати ID вручну змінними Render:
+// ROAPP_CAMPAIGN_INSTAGRAM, ROAPP_CAMPAIGN_TELEGRAM, ROAPP_CAMPAIGN_WEBSITE
+// ---------------------------------------------------------------------------
+const CAMPAIGN_ENDPOINTS = ["/marketing/campaigns", "/marketing/ad-campaigns", "/ad-campaigns", "/settings/ad-campaigns", "/orders/ad-campaigns"];
+let cachedCampaigns = null;
+async function getAdCampaigns() {
+  if (cachedCampaigns) return cachedCampaigns;
+  for (const ep of CAMPAIGN_ENDPOINTS) {
+    try {
+      const r = await roappGet(ep);
+      if (r.status !== 200) continue;
+      const list = listFrom(r.body).filter((c) => c && c.id);
+      if (list.length) {
+        console.log(`RO App рекламні кампанії (${ep}):`, JSON.stringify(list.map((c) => ({ id: c.id, name: c.name || c.title }))).slice(0, 800));
+        cachedCampaigns = { endpoint: ep, list };
+        return cachedCampaigns;
+      }
+    } catch (e) {}
+  }
+  console.warn("RO App: список рекламних кампаній через API не знайдено — використовую лише змінні ROAPP_CAMPAIGN_*");
+  cachedCampaigns = { endpoint: null, list: [] };
+  return cachedCampaigns;
+}
+const CAMPAIGN_RULES = {
+  instagram: { env: "ROAPP_CAMPAIGN_INSTAGRAM", re: /insta|інста|инста/i },
+  telegram: { env: "ROAPP_CAMPAIGN_TELEGRAM", re: /telegram|телеграм|тг\b/i },
+  website: { env: "ROAPP_CAMPAIGN_WEBSITE", re: /сайт/i },
+};
+async function campaignIdForSource(source) {
+  const rule = CAMPAIGN_RULES[String(source || "").toLowerCase()];
+  if (!rule) return null;
+  if (process.env[rule.env]) return Number(process.env[rule.env]);
+  const { list } = await getAdCampaigns();
+  const found = list.find((c) => rule.re.test(String(c.name || c.title || "")));
+  if (!found) {
+    if (source === "instagram" || source === "telegram") {
+      alertAdmin(`У RO App не знайдено рекламну кампанію для джерела "${source}". Створіть кампанію з назвою "Instagram"/"Telegram" (Налаштування → Маркетинг → Рекламні кампанії) або задайте ${rule.env} у Render.`, "campaign-" + source);
+    }
+    return null;
+  }
+  return Number(found.id);
+}
+
 async function bookSlot(userId, input, source) {
   const cache = offeredSlots.get(userId) || {};
   const slot = cache[input.slot_id];
@@ -1186,7 +1234,9 @@ async function bookSlot(userId, input, source) {
   const svc = BOOKING_SERVICES[slot.serviceKey];
 
   // 1) Клієнт: шукаємо за телефоном, якщо немає — створюємо
-  const clientId = await findOrCreateClient(input.name, input.phone);
+  // Рекламна кампанія = джерело заявки (Instagram / Telegram / Сайт)
+  const campaignId = await campaignIdForSource(source);
+  const clientId = await findOrCreateClient(input.name, input.phone, campaignId);
   if (clientId === "INVALID_PHONE") {
     return { ok: false, error: "CRM не прийняла номер телефону як некоректний. Запис ще НЕ створено. Попроси клієнта перевірити номер і написати його ще раз повністю (наприклад, 067 123 45 67), потім знову виклич book_slot з тим самим slot_id." };
   }
@@ -1222,7 +1272,14 @@ async function bookSlot(userId, input, source) {
   if (cf.year && input.year) customFields[cf.year] = String(input.year);
   body.custom_fields = JSON.stringify(customFields);
 
+  if (campaignId) body.ad_campaign_id = campaignId;
+
   let r = await roappPost("/orders", body);
+  if (r.status >= 400 && body.ad_campaign_id && /campaign/i.test(r.text)) {
+    console.warn("RO App не прийняв ad_campaign_id — створюю замовлення без нього");
+    delete body.ad_campaign_id;
+    r = await roappPost("/orders", body);
+  }
   if (r.status >= 400 && /custom_fields/.test(r.text)) {
     // запасний варіант — поля як об'єкт, а не рядок
     r = await roappPost("/orders", { ...body, custom_fields: customFields });
@@ -1318,7 +1375,7 @@ async function findClientByPhone(digits) {
   const p = listFrom(r.body)[0];
   return p && p.id ? Number(p.id) : null;
 }
-async function findOrCreateClient(name, phone) {
+async function findOrCreateClient(name, phone, campaignId = null) {
   const digits = normalizePhone(phone);
   let id = await findClientByPhone(digits);
   if (id) return id;
@@ -1329,6 +1386,7 @@ async function findOrCreateClient(name, phone) {
     phones: [{ title: "Мобільний", phone: "+" + digits, notify: true, has_viber: false, has_whatsapp: false }],
     notes: "Створено чат-ботом (онлайн-запис)",
   };
+  if (campaignId) body.ad_campaign_id = campaignId;
   const r = await roappPost("/contacts/people", body);
   console.log("RO App створення клієнта:", r.status, r.text.slice(0, 500));
   if (r.status === 400 && /phone/i.test(r.text)) return "INVALID_PHONE";
