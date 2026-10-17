@@ -74,7 +74,7 @@ const PROMPT_DETAILING = fs.readFileSync(
 // перезапуске сервера), но для старта этого достаточно.
 // ---------------------------------------------------------------------------
 const conversations = new Map();
-const MAX_HISTORY_MESSAGES = 20; // сколько последних сообщений держим в контексте
+const MAX_HISTORY_MESSAGES = 30; // сколько последних сообщений держим в контексте
 
 function getHistory(userId) {
   if (!conversations.has(userId)) {
@@ -85,6 +85,13 @@ function getHistory(userId) {
 
 function pushToHistory(userId, role, content) {
   const history = getHistory(userId);
+  const last = history[history.length - 1];
+  // Два повідомлення поспіль від однієї сторони (напр. клієнт написав двічі) — об'єднуємо,
+  // бо Anthropic API очікує чергування user/assistant
+  if (last && last.role === role && typeof last.content === "string" && typeof content === "string") {
+    last.content += "\n" + content;
+    return;
+  }
   history.push({ role, content });
   while (history.length > MAX_HISTORY_MESSAGES) {
     history.shift();
@@ -680,6 +687,53 @@ async function sendInstagram(recipientId, text) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// ПАМ'ЯТЬ ПЕРЕПИСКИ В INSTAGRAM
+// Сервер на Render засинає й перезапускається, тому історія в пам'яті губиться.
+// Для Instagram відновлюємо її з самого Instagram (Graph API, остання переписка
+// з клієнтом), щоб бот пам'ятав марку/модель авто, ім'я, телефон і не перепитував.
+// Відповіді менеджера, написані вручну в Instagram, теж потрапляють в історію.
+// ---------------------------------------------------------------------------
+const igHistoryLoaded = new Set();
+async function loadInstagramHistory(senderId, currentMid) {
+  const userId = `instagram:${senderId}`;
+  if (igHistoryLoaded.has(userId)) return;
+  igHistoryLoaded.add(userId);
+  if (getHistory(userId).length > 0) return; // уже є в пам'яті
+  const token = process.env.INSTAGRAM_PAGE_ACCESS_TOKEN;
+  if (!token) return;
+  try {
+    const url =
+      `https://graph.facebook.com/v19.0/me/conversations?platform=instagram&user_id=${encodeURIComponent(senderId)}` +
+      `&fields=messages.limit(${MAX_HISTORY_MESSAGES}){id,message,from,created_time}&access_token=${token}`;
+    const r = await fetch(url);
+    const j = await r.json();
+    if (!r.ok) {
+      console.warn("Instagram: не вдалося завантажити історію:", r.status, JSON.stringify(j).slice(0, 300));
+      return;
+    }
+    const msgs = (j.data?.[0]?.messages?.data || [])
+      .filter((m) => m.id !== currentMid && m.message && m.message.trim())
+      .reverse(); // API віддає від нових до старих
+    let count = 0;
+    for (const m of msgs) {
+      const role = m.from && String(m.from.id) === String(senderId) ? "user" : "assistant";
+      if (count === 0 && role === "assistant") continue; // історія має починатися з клієнта
+      pushToHistory(userId, role, m.message);
+      count++;
+    }
+    // Якщо остання репліка від клієнта — нове повідомлення просто доклеїться до неї (pushToHistory)
+    // Якщо клієнт уже залишав телефон у старій переписці — заявка по ньому вже була відправлена,
+    // тож після перезапуску сервера не дублюємо Звернення в CRM
+    if (msgs.some((m) => String(m.from?.id) === String(senderId) && (m.message.match(/\+?\d[\d\s\-()]{8,}\d/g) || []).some(isValidPhone))) {
+      leadAlreadySent.add(userId);
+    }
+    console.log(`Instagram: відновлено ${count} попередніх повідомлень для ${userId}`);
+  } catch (e) {
+    console.warn("Instagram: помилка завантаження історії:", e);
+  }
+}
+
 app.post("/webhook/instagram", async (req, res) => {
   console.log("INSTAGRAM WEBHOOK ПОЛУЧЕНО:", JSON.stringify(req.body));
   res.sendStatus(200);
@@ -693,6 +747,7 @@ app.post("/webhook/instagram", async (req, res) => {
     if (!senderId || !userText || messaging?.message?.is_echo) return;
 
     const instagramUserId = `instagram:${senderId}`;
+    await loadInstagramHistory(senderId, messaging?.message?.mid);
     const replyText = await askClaude(instagramUserId, userText, "instagram");
 
     if (!leadAlreadySent.has(instagramUserId)) {
