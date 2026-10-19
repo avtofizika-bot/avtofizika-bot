@@ -249,6 +249,35 @@ async function classifyTopic(userId, latestUserText) {
 // блоків вида [{type:"text", text:"..."}, {type:"image", source:{...}}]
 // — так бот может "видеть" присланные клиентом фото.
 // ---------------------------------------------------------------------------
+// Приводить історію до формату, який приймає Anthropic API:
+// перше і останнє повідомлення — від клієнта (user), ролі чергуються, порожніх немає.
+function sanitizeMessages(history, latestContent) {
+  const out = [];
+  for (const m of history) {
+    if (!m || !m.role) continue;
+    const empty = typeof m.content === "string" ? !m.content.trim() : !(Array.isArray(m.content) && m.content.length);
+    if (empty) continue;
+    if (!out.length && m.role !== "user") continue; // має починатися з клієнта
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) {
+      // дві репліки поспіль від однієї сторони — об'єднуємо
+      const toArr = (c) => (typeof c === "string" ? [{ type: "text", text: c }] : c);
+      last.content = typeof last.content === "string" && typeof m.content === "string"
+        ? last.content + "\n" + m.content
+        : [...toArr(last.content), ...toArr(m.content)];
+      continue;
+    }
+    out.push({ role: m.role, content: m.content });
+  }
+  // має закінчуватися повідомленням клієнта. Буває, що клієнт пише нове повідомлення,
+  // поки бот ще відповідає на попереднє, — тоді відповідь бота стає в кінець історії.
+  // У такому разі повторюємо в кінці поточне повідомлення клієнта.
+  if (!out.length || out[out.length - 1].role !== "user") {
+    out.push({ role: "user", content: latestContent });
+  }
+  return out;
+}
+
 async function askClaude(userId, content, source = "chat") {
   pushToHistory(userId, "user", content);
   logActivity(userId);
@@ -283,8 +312,10 @@ async function askClaude(userId, content, source = "chat") {
     systemPrompt += "\n\n## Онлайн-запис вимкнено\nНе пропонуй обрати дату й час у чаті — лише зворотний дзвінок менеджера.";
   }
 
-  // Робоча копія розмови для цього запиту (з проміжними викликами інструментів)
-  const messages = [...getHistory(userId)];
+  // Робоча копія розмови для цього запиту (з проміжними викликами інструментів).
+  // Нові моделі Anthropic вимагають: розмова починається і ЗАКІНЧУЄТЬСЯ повідомленням клієнта (user),
+  // ролі чергуються. Очищаємо копію, щоб жоден збій в історії не ламав відповідь.
+  const messages = sanitizeMessages(getHistory(userId), content);
   let replyText = "";
 
   for (let step = 0; step < 5; step++) {
@@ -695,6 +726,8 @@ async function sendInstagram(recipientId, text) {
 // Відповіді менеджера, написані вручну в Instagram, теж потрапляють в історію.
 // ---------------------------------------------------------------------------
 const igHistoryLoaded = new Set();
+const REPEAT_LEAD_DAYS = Number(process.env.REPEAT_LEAD_DAYS || 3);
+const igReturningClients = new Map(); // userId -> дата попередньої переписки
 async function loadInstagramHistory(senderId, currentMid) {
   const userId = `instagram:${senderId}`;
   if (igHistoryLoaded.has(userId)) return;
@@ -723,10 +756,18 @@ async function loadInstagramHistory(senderId, currentMid) {
       count++;
     }
     // Якщо остання репліка від клієнта — нове повідомлення просто доклеїться до неї (pushToHistory)
-    // Якщо клієнт уже залишав телефон у старій переписці — заявка по ньому вже була відправлена,
-    // тож після перезапуску сервера не дублюємо Звернення в CRM
-    if (msgs.some((m) => String(m.from?.id) === String(senderId) && (m.message.match(/\+?\d[\d\s\-()]{8,}\d/g) || []).some(isValidPhone))) {
+    // Телефон у переписці за останні REPEAT_LEAD_DAYS днів — це та сама розмова, заявку вже
+    // відправлено, тож після перезапуску сервера не дублюємо Звернення.
+    // Якщо клієнт повертається пізніше — це НОВЕ звернення: воно піде в CRM з позначкою
+    // «Повторне звернення» і датою попередньої переписки, щоб менеджер одразу це бачив.
+    const now = Date.now();
+    const hasPhone = (m) => String(m.from?.id) === String(senderId) && (m.message.match(/\+?\d[\d\s\-()]{8,}\d/g) || []).some(isValidPhone);
+    const recent = msgs.filter((m) => now - new Date(m.created_time).getTime() < REPEAT_LEAD_DAYS * 86400000);
+    if (recent.some(hasPhone)) {
       leadAlreadySent.add(userId);
+    } else if (msgs.length) {
+      const lastOld = msgs[msgs.length - 1].created_time;
+      igReturningClients.set(userId, new Date(lastOld).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" }));
     }
     console.log(`Instagram: відновлено ${count} попередніх повідомлень для ${userId}`);
   } catch (e) {
@@ -753,6 +794,9 @@ app.post("/webhook/instagram", async (req, res) => {
     if (!leadAlreadySent.has(instagramUserId)) {
       const lead = await extractLeadFromConversation(instagramUserId);
       if (lead && isValidPhone(lead.phone)) {
+        if (igReturningClients.has(instagramUserId)) {
+          lead.topic = `🔁 ПОВТОРНЕ ЗВЕРНЕННЯ (клієнт уже писав в Instagram ${igReturningClients.get(instagramUserId)}). ${lead.topic || ""}`;
+        }
         handleLead(instagramUserId, lead, "instagram");
       }
     }
@@ -1309,7 +1353,8 @@ async function bookSlot(userId, input, source) {
     scheduled_to: isoZ(orderEnd),
     resource_id: svc.box,
     malfunction: `${svc.crmName || svc.title}. Авто: ${carText(input)}${input.comment ? ". " + crmComment(svc, input.comment) : ""}`.slice(0, 500),
-    manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.`,
+    manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.` +
+      (typeof igReturningClients !== "undefined" && igReturningClients.has(userId) ? ` 🔁 Повторне звернення — клієнт уже писав в Instagram ${igReturningClients.get(userId)}.` : ""),
   };
   const cf = await getCarFieldIds();
   const customFields = {};
