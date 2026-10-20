@@ -1326,6 +1326,7 @@ app.get("/api/campaigns", async (req, res) => {
   res.json({ chosen: pick, campaigns: c.list.map((x) => ({ id: x.id, name: x.name || x.title })), endpoint: c.endpoint, samples: c.samples, tried: c.tried, fields_seen: c.fields_seen });
 });
 
+const campaignAlerted = new Set();
 const CAMPAIGN_RULES = {
   instagram: { env: "ROAPP_CAMPAIGN_INSTAGRAM", re: /insta|інста|инста/i },
   telegram: { env: "ROAPP_CAMPAIGN_TELEGRAM", re: /telegram|телеграм|тг\b/i },
@@ -1338,7 +1339,8 @@ async function campaignIdForSource(source) {
   const { list } = await getAdCampaigns();
   const found = list.find((c) => rule.re.test(String(c.name || c.title || "")));
   if (!found) {
-    if (source === "instagram" || source === "telegram") {
+    if ((source === "instagram" || source === "telegram") && !campaignAlerted.has(source)) {
+      campaignAlerted.add(source); // попереджаємо один раз, а не на кожне замовлення
       alertAdmin(`У RO App не знайдено рекламну кампанію для джерела "${source}".\nКампанії, які бачить бот: ${list.map((c) => `${c.name} (id ${c.id})`).join(", ") || "жодної"}.\nСтворіть кампанію з назвою "${source === "instagram" ? "Instagram" : "Telegram"}" у RO App або задайте її ID у змінній ${rule.env} у Render.`, "campaign-" + source);
     }
     return null;
