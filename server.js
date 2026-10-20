@@ -1260,12 +1260,13 @@ const CAMPAIGN_ENDPOINTS = ["/marketing/campaigns", "/marketing/ad-campaigns", "
 let cachedCampaigns = null;
 let campaignsCachedAt = 0;
 // Шукає в об'єкті (замовлення/клієнт) поля з "campaign" у назві → {id, name}
-function campaignsFromObject(obj, out) {
+function campaignsFromObject(obj, out, samples) {
   if (!obj || typeof obj !== "object") return;
-  for (const [k, v] of Object.entries(obj)) {
-    if (!/campaign/i.test(k)) continue;
-    if (v && typeof v === "object" && v.id) out.set(String(v.id), { id: v.id, name: v.name || v.title || "" });
-  }
+  const id = obj.ad_campaign_id ?? (obj.ad_campaign && typeof obj.ad_campaign === "object" ? obj.ad_campaign.id : null);
+  const raw = obj.ad_campaign;
+  const name = raw && typeof raw === "object" ? raw.name || raw.title || "" : typeof raw === "string" ? raw : "";
+  if (samples && samples.length < 5 && (id || raw)) samples.push({ ad_campaign_id: obj.ad_campaign_id ?? null, ad_campaign: raw ?? null });
+  if (id) out.set(String(id), { id, name: name || (out.get(String(id)) || {}).name || "" });
 }
 async function getAdCampaigns() {
   if (cachedCampaigns && (cachedCampaigns.list.length || Date.now() - campaignsCachedAt < 60 * 60 * 1000)) return cachedCampaigns;
@@ -1289,19 +1290,26 @@ async function getAdCampaigns() {
   // Запасний варіант: збираємо кампанії з останніх замовлень і клієнтів (у них є поле рекламної кампанії)
   const found = new Map();
   const sampleKeys = new Set();
-  for (const ep of [`/orders?branch_ids=${ROAPP_BRANCH_ID}&sort=-created_at`, "/orders", "/contacts/people"]) {
+  const samples = [];
+  const eps = [];
+  for (let page = 1; page <= 10; page++) eps.push(`/orders?branch_ids=${ROAPP_BRANCH_ID}&page=${page}`);
+  eps.push("/contacts/people", "/contacts/people?page=2");
+  for (const ep of eps) {
     try {
       const r = await roappGet(ep);
       tried.push(`${ep} → ${r.status}`);
-      for (const o of listFrom(r.body)) {
+      const items = listFrom(r.body);
+      for (const o of items) {
         Object.keys(o || {}).filter((k) => /campaign|source|channel/i.test(k)).forEach((k) => sampleKeys.add(k));
-        campaignsFromObject(o, found);
+        campaignsFromObject(o, found, samples);
+        if (o && o.client) campaignsFromObject(o.client, found, samples);
       }
+      if (!items.length) continue;
     } catch (e) {}
   }
   const list = [...found.values()];
   console.log("RO App: кампанії з замовлень/клієнтів:", JSON.stringify(list), "поля:", [...sampleKeys].join(","), "спроби:", tried.join("; "));
-  cachedCampaigns = { endpoint: list.length ? "orders" : null, list, tried, fields_seen: [...sampleKeys] };
+  cachedCampaigns = { endpoint: list.length ? "orders" : null, list, tried, fields_seen: [...sampleKeys], samples };
   return cachedCampaigns;
 }
 // Перевірка: /api/campaigns?secret=ROAPP_DEBUG_SECRET — які рекламні кампанії бачить бот
@@ -1315,7 +1323,7 @@ app.get("/api/campaigns", async (req, res) => {
     pick[src] = process.env[rule.env] ? `ID з Render: ${process.env[rule.env]}` :
       (c.list.find((x) => rule.re.test(String(x.name || x.title || ""))) || "не знайдено");
   }
-  res.json({ chosen: pick, campaigns: c.list.map((x) => ({ id: x.id, name: x.name || x.title })), endpoint: c.endpoint, tried: c.tried, fields_seen: c.fields_seen });
+  res.json({ chosen: pick, campaigns: c.list.map((x) => ({ id: x.id, name: x.name || x.title })), endpoint: c.endpoint, samples: c.samples, tried: c.tried, fields_seen: c.fields_seen });
 });
 
 const CAMPAIGN_RULES = {
