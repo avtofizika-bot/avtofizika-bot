@@ -402,7 +402,7 @@ async function extractLeadFromConversation(userId) {
           "Твоє завдання: перевірити, чи клієнт десь у переписці назвав " +
           "І своє ім'я, І номер телефону (обидва одразу, в будь-якому повідомленні). " +
           "Якщо так — зроби докладну виписку з усієї переписки і поверни РІВНО такий JSON, нічого більше: " +
-          '{"found":true,"name":"ім\'я клієнта","phone":"номер телефону як написав клієнт","topic":"розгорнутий опис запиту: марка, модель і рік авто (якщо клієнт їх називав — обов\'язково включи; якщо не називав, напиши \'марка/модель не вказані\'), суть проблеми чи бажана послуга, і будь-які інші важливі деталі з розмови (наприклад, орієнтовна ціна, яку вже озвучили, чи домовленості про час)"} ' +
+          '{"found":true,"name":"ім\'я клієнта","phone":"номер телефону як написав клієнт","contact_method":"як клієнт хоче, щоб з ним звʼязались: Дзвінок / Viber / Telegram / Instagram (якщо клієнт не казав — порожній рядок)","topic":"розгорнутий опис запиту: марка, модель і рік авто (якщо клієнт їх називав — обов\'язково включи; якщо не називав, напиши \'марка/модель не вказані\'), суть проблеми чи бажана послуга, і будь-які інші важливі деталі з розмови (наприклад, орієнтовна ціна, яку вже озвучили, чи домовленості про час)"} ' +
           "Якщо клієнт НЕ називав одночасно і ім'я, і телефон — поверни РІВНО: " +
           '{"found":false} ' +
           "Поле topic має бути змістовним (2-4 речення), щоб менеджер, прочитавши лише його, одразу розумів ситуацію клієнта без потреби передзвонювати для уточнення базових деталей. " +
@@ -433,6 +433,7 @@ async function extractLeadFromConversation(userId) {
         name: parsed.name,
         phone: parsed.phone,
         topic: parsed.topic || "",
+        contact_method: parsed.contact_method || "",
       };
     }
     return null;
@@ -471,7 +472,8 @@ async function sendLeadToCRM(lead, source) {
   // Додаємо дату/час прямо в текст опису — так вона гарантовано буде
   // видна менеджеру в РемОнлайн, незалежно від того, чи є там окреме
   // поле "термін"/"дедлайн".
-  const topicWithTimestamp = `[Заявка від ${timestamp}] ${lead.topic || ""}`.trim();
+  const contactLine = lead.contact_method ? `📞 Зв'язатися: ${lead.contact_method}. ` : "";
+  const topicWithTimestamp = `[Заявка від ${timestamp}] ${contactLine}${lead.topic || ""}`.trim();
 
   // ISO-формат (наприклад, 2026-09-15T15:16:00+03:00) — саме такий формат
   // очікують поля типу "дата/час" у більшості CRM, включно з полем
@@ -489,6 +491,7 @@ async function sendLeadToCRM(lead, source) {
         timestamp, // людський формат — для відображення в тексті
         deadline: deadlineIso, // ISO-формат — для поля "Кінцевий термін"
         source, // "telegram" або "website"
+        contact_method: lead.contact_method || "",
         source_label: { instagram: "Instagram", telegram: "Telegram", website: "Сайт заявки" }[source] || source, // для поля "Рекламна кампанія" в Make
       }),
     });
@@ -1225,7 +1228,6 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
         time: svc.arrivalNote
           ? `${s}–${e} (${svc.arrivalNote})`
           : svc.slots.length === 1 ? `з ${s} (машину залишають на день)` : `${s}–${e}`,
-        master: MASTERS[master],
       });
     }
   }
@@ -1256,24 +1258,66 @@ async function roappPost(path, body) {
 // ---------------------------------------------------------------------------
 const CAMPAIGN_ENDPOINTS = ["/marketing/campaigns", "/marketing/ad-campaigns", "/ad-campaigns", "/settings/ad-campaigns", "/orders/ad-campaigns"];
 let cachedCampaigns = null;
+let campaignsCachedAt = 0;
+// Шукає в об'єкті (замовлення/клієнт) поля з "campaign" у назві → {id, name}
+function campaignsFromObject(obj, out) {
+  if (!obj || typeof obj !== "object") return;
+  for (const [k, v] of Object.entries(obj)) {
+    if (!/campaign/i.test(k)) continue;
+    if (v && typeof v === "object" && v.id) out.set(String(v.id), { id: v.id, name: v.name || v.title || "" });
+  }
+}
 async function getAdCampaigns() {
-  if (cachedCampaigns) return cachedCampaigns;
+  if (cachedCampaigns && (cachedCampaigns.list.length || Date.now() - campaignsCachedAt < 60 * 60 * 1000)) return cachedCampaigns;
+  campaignsCachedAt = Date.now();
+  const tried = [];
   for (const ep of CAMPAIGN_ENDPOINTS) {
     try {
       const r = await roappGet(ep);
+      tried.push(`${ep} → ${r.status}`);
       if (r.status !== 200) continue;
       const list = listFrom(r.body).filter((c) => c && c.id);
       if (list.length) {
         console.log(`RO App рекламні кампанії (${ep}):`, JSON.stringify(list.map((c) => ({ id: c.id, name: c.name || c.title }))).slice(0, 800));
-        cachedCampaigns = { endpoint: ep, list };
+        cachedCampaigns = { endpoint: ep, list, tried };
         return cachedCampaigns;
+      }
+    } catch (e) {
+      tried.push(`${ep} → ${e}`);
+    }
+  }
+  // Запасний варіант: збираємо кампанії з останніх замовлень і клієнтів (у них є поле рекламної кампанії)
+  const found = new Map();
+  const sampleKeys = new Set();
+  for (const ep of [`/orders?branch_ids=${ROAPP_BRANCH_ID}&sort=-created_at`, "/orders", "/contacts/people"]) {
+    try {
+      const r = await roappGet(ep);
+      tried.push(`${ep} → ${r.status}`);
+      for (const o of listFrom(r.body)) {
+        Object.keys(o || {}).filter((k) => /campaign|source|channel/i.test(k)).forEach((k) => sampleKeys.add(k));
+        campaignsFromObject(o, found);
       }
     } catch (e) {}
   }
-  console.warn("RO App: список рекламних кампаній через API не знайдено — використовую лише змінні ROAPP_CAMPAIGN_*");
-  cachedCampaigns = { endpoint: null, list: [] };
+  const list = [...found.values()];
+  console.log("RO App: кампанії з замовлень/клієнтів:", JSON.stringify(list), "поля:", [...sampleKeys].join(","), "спроби:", tried.join("; "));
+  cachedCampaigns = { endpoint: list.length ? "orders" : null, list, tried, fields_seen: [...sampleKeys] };
   return cachedCampaigns;
 }
+// Перевірка: /api/campaigns?secret=ROAPP_DEBUG_SECRET — які рекламні кампанії бачить бот
+app.get("/api/campaigns", async (req, res) => {
+  if (!process.env.ROAPP_DEBUG_SECRET || req.query.secret !== process.env.ROAPP_DEBUG_SECRET) return res.sendStatus(403);
+  cachedCampaigns = null;
+  const c = await getAdCampaigns();
+  const pick = {};
+  for (const src of ["instagram", "telegram", "website"]) {
+    const rule = CAMPAIGN_RULES[src];
+    pick[src] = process.env[rule.env] ? `ID з Render: ${process.env[rule.env]}` :
+      (c.list.find((x) => rule.re.test(String(x.name || x.title || ""))) || "не знайдено");
+  }
+  res.json({ chosen: pick, campaigns: c.list.map((x) => ({ id: x.id, name: x.name || x.title })), endpoint: c.endpoint, tried: c.tried, fields_seen: c.fields_seen });
+});
+
 const CAMPAIGN_RULES = {
   instagram: { env: "ROAPP_CAMPAIGN_INSTAGRAM", re: /insta|інста|инста/i },
   telegram: { env: "ROAPP_CAMPAIGN_TELEGRAM", re: /telegram|телеграм|тг\b/i },
@@ -1287,7 +1331,7 @@ async function campaignIdForSource(source) {
   const found = list.find((c) => rule.re.test(String(c.name || c.title || "")));
   if (!found) {
     if (source === "instagram" || source === "telegram") {
-      alertAdmin(`У RO App не знайдено рекламну кампанію для джерела "${source}". Створіть кампанію з назвою "Instagram"/"Telegram" (Налаштування → Маркетинг → Рекламні кампанії) або задайте ${rule.env} у Render.`, "campaign-" + source);
+      alertAdmin(`У RO App не знайдено рекламну кампанію для джерела "${source}".\nКампанії, які бачить бот: ${list.map((c) => `${c.name} (id ${c.id})`).join(", ") || "жодної"}.\nСтворіть кампанію з назвою "${source === "instagram" ? "Instagram" : "Telegram"}" у RO App або задайте її ID у змінній ${rule.env} у Render.`, "campaign-" + source);
     }
     return null;
   }
@@ -1354,6 +1398,7 @@ async function bookSlot(userId, input, source) {
     resource_id: svc.box,
     malfunction: `${svc.crmName || svc.title}. Авто: ${carText(input)}${input.comment ? ". " + crmComment(svc, input.comment) : ""}`.slice(0, 500),
     manager_notes: `Онлайн-запис з чат-бота (${source}). Клієнт: ${input.name}, тел: ${input.phone}.` +
+      (input.contact_method ? ` 📞 Зв'язатися: ${input.contact_method}.` : "") +
       (typeof igReturningClients !== "undefined" && igReturningClients.has(userId) ? ` 🔁 Повторне звернення — клієнт уже писав в Instagram ${igReturningClients.get(userId)}.` : ""),
   };
   const cf = await getCarFieldIds();
@@ -1405,10 +1450,11 @@ async function bookSlot(userId, input, source) {
     client_name: input.name,
     client_phone: "+" + normalizePhone(input.phone),
     car: carText(input),
+    contact_method: input.contact_method || "",
     source,
   });
 
-  return { ok: true, day: dayLabel(start), master: MASTERS[slot.masterId], service: svc.title, order_number: order.number || "" };
+  return { ok: true, day: dayLabel(start), service: svc.title, order_number: order.number || "" };
 }
 
 // Відправляє дані нового онлайн-замовлення в Make (окремий сценарій),
@@ -1568,6 +1614,7 @@ const BOOKING_TOOLS = [
         model: { type: "string", description: "Модель авто (напр. X3)" },
         year: { type: "string", description: "Рік випуску авто (напр. 2022)" },
         comment: { type: "string", description: "Коротко суть запиту клієнта" },
+        contact_method: { type: "string", description: "Як клієнт хоче, щоб менеджер з ним зв'язався: Дзвінок, Viber, Telegram або Instagram" },
       },
       required: ["slot_id", "name", "phone", "brand", "model", "year"],
     },
