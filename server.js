@@ -115,27 +115,41 @@ const leadAlreadySent = new Set();
 const LEAD_DELAY_MIN = Number(process.env.LEAD_DELAY_MIN || 10);
 const pendingLeads = new Map(); // userId -> { lead, source, timer }
 
+// Звернення не відправляємо миттєво: чекаємо LEAD_HOLD_MIN хв після останнього повідомлення клієнта
+// (або LEAD_DELAY_MIN, якщо він обирає вікно для онлайн-запису). Перед відправкою ще раз
+// перечитуємо всю переписку: якщо клієнт за цей час відмовився від послуги — заявку в CRM не шлемо.
+const LEAD_HOLD_MIN = Number(process.env.LEAD_HOLD_MIN || 5);
 function handleLead(userId, lead, source) {
   if (leadAlreadySent.has(userId)) return;
   const offered = typeof offeredSlots !== "undefined" && offeredSlots.get(userId);
   const inBookingFlow = offered && Object.keys(offered).length > 0;
-  if (!inBookingFlow) {
-    leadAlreadySent.add(userId);
-    sendLeadToCRM(lead, source);
-    return;
-  }
-  // Клієнт у процесі онлайн-запису — чекаємо
+  const delayMin = inBookingFlow ? LEAD_DELAY_MIN : LEAD_HOLD_MIN;
   const prev = pendingLeads.get(userId);
   if (prev) clearTimeout(prev.timer);
-  const timer = setTimeout(() => {
-    pendingLeads.delete(userId);
-    if (leadAlreadySent.has(userId)) return; // уже записався онлайн
-    leadAlreadySent.add(userId);
-    console.log(`[${userId}] онлайн-запис не завершено за ${LEAD_DELAY_MIN} хв — відправляю Звернення`);
-    sendLeadToCRM(lead, source);
-  }, LEAD_DELAY_MIN * 60 * 1000);
+  const timer = setTimeout(() => finalizeLead(userId).catch((e) => console.error("finalizeLead:", e)), delayMin * 60 * 1000);
   pendingLeads.set(userId, { lead, source, timer });
-  console.log(`[${userId}] Звернення відкладено (клієнт обирає вікно для онлайн-запису)`);
+  console.log(`[${userId}] Звернення буде відправлено через ${delayMin} хв (якщо клієнт не відмовиться${inBookingFlow ? " і не запишеться онлайн" : ""})`);
+}
+async function finalizeLead(userId) {
+  const p = pendingLeads.get(userId);
+  pendingLeads.delete(userId);
+  if (!p || leadAlreadySent.has(userId)) return; // уже записався онлайн або вже відправлено
+  // Остаточна перевірка всієї переписки
+  const fresh = await extractLeadFromConversation(userId);
+  if (fresh && fresh.declined) {
+    console.log(`[${userId}] клієнт відмовився від послуги — Звернення в CRM НЕ відправляю`);
+    logEvent("lead_declined", userId, `${p.lead.name}, ${p.lead.phone}`);
+    leadAlreadySent.add(userId); // щоб не відправити пізніше випадково
+    return;
+  }
+  let lead = p.lead;
+  if (fresh && fresh.phone && isValidPhone(fresh.phone)) {
+    // свіжіша виписка (могли з'явитися нові деталі); зберігаємо позначку «повторне звернення»
+    const prefix = ((p.lead.topic || "").match(/^🔁[^)]*\)\.\s*/) || [""])[0];
+    lead = { ...fresh, topic: prefix + (fresh.topic || "") };
+  }
+  leadAlreadySent.add(userId);
+  sendLeadToCRM(lead, p.source);
 }
 function cancelPendingLead(userId) {
   const p = pendingLeads.get(userId);
@@ -405,6 +419,11 @@ async function extractLeadFromConversation(userId) {
           '{"found":true,"name":"ім\'я клієнта","phone":"номер телефону як написав клієнт","contact_method":"як клієнт хоче, щоб з ним звʼязались: Дзвінок / Viber / Telegram / Instagram (якщо клієнт не казав — порожній рядок)","topic":"розгорнутий опис запиту: марка, модель і рік авто (якщо клієнт їх називав — обов\'язково включи; якщо не називав, напиши \'марка/модель не вказані\'), суть проблеми чи бажана послуга, і будь-які інші важливі деталі з розмови (наприклад, орієнтовна ціна, яку вже озвучили, чи домовленості про час)"} ' +
           "Якщо клієнт НЕ називав одночасно і ім'я, і телефон — поверни РІВНО: " +
           '{"found":false} ' +
+          "ВАЖЛИВО: якщо клієнт залишив контакти, але ПІЗНІШЕ в переписці явно відмовився від послуги " +
+          "(наприклад: «не треба», «передумав», «дорого, не буду», «відмовляюсь», «вже зробив в іншому місці», «не телефонуйте») " +
+          "і після цього НЕ змінив думку — поверни РІВНО: " +
+          '{"found":false,"declined":true} ' +
+          "Сумнів чи питання («подумаю», «дорогувато», «а дешевше можна?») — це НЕ відмова. " +
           "Поле topic має бути змістовним (2-4 речення), щоб менеджер, прочитавши лише його, одразу розумів ситуацію клієнта без потреби передзвонювати для уточнення базових деталей. " +
           "Відповідай лише цим JSON, без жодного іншого тексту, пояснень чи форматування.",
         messages: [
@@ -428,6 +447,7 @@ async function extractLeadFromConversation(userId) {
     raw = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
     const parsed = JSON.parse(raw);
 
+    if (parsed.declined) return { declined: true };
     if (parsed.found && parsed.name && parsed.phone) {
       return {
         name: parsed.name,
@@ -1872,6 +1892,7 @@ async function sendDailyReport(manual = false) {
     `Звернень у CRM: ${count("lead")}\n` +
     `Онлайн-записів (замовлень): ${count("order")}\n` +
     `Некоректних номерів: ${count("bad_phone")}\n` +
+    `Відмовились після контактів (не відправлено в CRM): ${count("lead_declined")}\n` +
     `Помилок: ${errors.length}` +
     (errors.length ? "\n" + errors.slice(-5).map((e) => "• " + e.detail).join("\n") : "") +
     `\n\n🔧 Техніка:\n${formatHealth(checks)}` +
