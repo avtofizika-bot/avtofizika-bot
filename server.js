@@ -512,6 +512,7 @@ async function sendLeadToCRM(lead, source) {
         deadline: deadlineIso, // ISO-формат — для поля "Кінцевий термін"
         source, // "telegram" або "website"
         contact_method: lead.contact_method || "",
+        ad_campaign_id: (await campaignIdForSource(source).catch(() => null)) || "", // для поля "Рекламна кампанія" у Зверненні (Make)
         source_label: { instagram: "Instagram", telegram: "Telegram", website: "Сайт заявки" }[source] || source, // для поля "Рекламна кампанія" в Make
       }),
     });
@@ -806,13 +807,45 @@ app.post("/webhook/instagram", async (req, res) => {
     const messaging = entry?.messaging?.[0];
     const senderId = messaging?.sender?.id;
     const userText = messaging?.message?.text;
+    // Фото від клієнта (Instagram присилає посилання на зображення у attachments)
+    const imageUrls = (messaging?.message?.attachments || [])
+      .filter((a) => a && a.type === "image" && a.payload && a.payload.url)
+      .map((a) => a.payload.url)
+      .slice(0, 3);
     // Instagram надсилає окремі "echo"-події на власні відправлені
     // повідомлення бота — їх ігноруємо, інакше бот буде відповідати сам собі.
-    if (!senderId || !userText || messaging?.message?.is_echo) return;
+    if (!senderId || messaging?.message?.is_echo) return;
+    if (!userText && imageUrls.length === 0) return;
+
+    // Фото завантажуємо одразу (посилання Instagram тимчасові) і передаємо Claude так само, як у Telegram
+    let contentForClaude = userText;
+    if (imageUrls.length) {
+      const images = [];
+      for (const url of imageUrls) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) continue;
+          const type = (r.headers.get("content-type") || "image/jpeg").split(";")[0];
+          const mediaType = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(type) ? type : "image/jpeg";
+          const data = Buffer.from(await r.arrayBuffer()).toString("base64");
+          images.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+        } catch (e) {
+          console.warn("Instagram: не вдалося завантажити фото:", e);
+        }
+      }
+      if (images.length) {
+        contentForClaude = [
+          ...images,
+          { type: "text", text: userText && userText.trim() ? userText : "Клієнт надіслав фото без підпису. Подивись на фото (фара, ліхтар чи кузов), прокоментуй стан і запропонуй релевантну послугу." },
+        ];
+      } else if (!userText) {
+        contentForClaude = "Клієнт надіслав фото, але його не вдалося відкрити. Попроси надіслати фото ще раз або коротко описати проблему.";
+      }
+    }
 
     const instagramUserId = `instagram:${senderId}`;
     await loadInstagramHistory(senderId, messaging?.message?.mid);
-    const replyText = await askClaude(instagramUserId, userText, "instagram");
+    const replyText = await askClaude(instagramUserId, contentForClaude, "instagram");
 
     if (!leadAlreadySent.has(instagramUserId)) {
       const lead = await extractLeadFromConversation(instagramUserId);
