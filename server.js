@@ -1004,7 +1004,7 @@ function crmComment(svc, comment) {
 
 const BOOKING_SERVICES = {
   tail_lights: {
-    title: "Задні ліхтарі (переробка поворотників / ремонт задніх ліхтарів; НЕ світловоди)",
+    title: "Задні ліхтарі — переробка поворотників (РЕМОНТ задніх ліхтарів зараз не робимо; НЕ світловоди)",
     crmName: "Задні ліхтарі", // коротка назва для CRM
     // Як називати роботу в CRM: будь-який опис про заміну червоних поворотників на жовті
     // замінюємо на стандартну назву "Переробка задніх ліхтарів"
@@ -1231,6 +1231,9 @@ function masterBusy(bookings, masterId, start, end) {
 // Кеш запропонованих слотів: userId -> { slotId: {...} }
 const offeredSlots = new Map();
 
+// Онлайн-запис лише на повністю вільні дні майстра (без жодного замовлення/запису).
+// Щоб повернути кілька авто на день (напр. Вадос — 2), поставте в Render ONLY_FREE_DAYS=false.
+const ONLY_FREE_DAYS = String(process.env.ONLY_FREE_DAYS || "true").toLowerCase() !== "false";
 async function findFreeSlots(userId, serviceKey, maxResults = 4) {
   const svc = BOOKING_SERVICES[serviceKey];
   if (!svc) return { error: "Невідома послуга. Доступні: " + Object.keys(BOOKING_SERVICES).join(", ") };
@@ -1255,6 +1258,8 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
         (b) => b.assignees.includes(Number(mId)) && b.start < dayEnd && (b.end || b.start) > dayStart
       );
       if (jobs.some((b) => b.dayOff)) continue; // у майстра вихідний цього дня
+      // Пропонуємо лише повністю вільні дні майстра: якщо в нього вже є хоч одна робота — день не пропонуємо
+      if (ONLY_FREE_DAYS && jobs.length > 0) continue;
       const cap = svc.capacity || svc.slots.length;
       if (jobs.length >= cap) continue; // день у майстра заповнений
       if (svc.capacity) { chosen = { mId, idx: 0 }; break; } // лише ліміт авто на день, час не важливий
@@ -1414,7 +1419,7 @@ async function bookSlot(userId, input, source) {
   const end = new Date(slot.end);
   const bookings = await fetchBusy(new Date(start.getTime() - 31 * 24 * 3600 * 1000), new Date(end.getTime() + 3600 * 1000));
   const svcDef = BOOKING_SERVICES[slot.serviceKey];
-  const svcCap = svcDef.capacity || svcDef.slots.length;
+  const svcCap = ONLY_FREE_DAYS ? 1 : svcDef.capacity || svcDef.slots.length;
   const sp = kyivParts(start);
   const dS = kyivToDate(sp.y, sp.m, sp.d, WORK_START);
   const dE = kyivToDate(sp.y, sp.m, sp.d, WORK_END);
