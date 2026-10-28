@@ -706,6 +706,35 @@ app.get("/webhook/instagram", (req, res) => {
 
 // Надсилання відповіді в Instagram Direct.
 // Instagram не показує **жирний** markdown і обмежує повідомлення 1000 символами — ділимо на частини.
+// ---------------------------------------------------------------------------
+// ПЕРЕДАЧА ДІАЛОГУ МЕНЕДЖЕРУ (Instagram)
+// Якщо менеджер сам написав клієнту в Instagram — бот замовкає в цьому діалозі
+// на MANAGER_PAUSE_HOURS годин (за замовчуванням 24), щоб не заважати.
+// Свої повідомлення бот запам'ятовує (id і текст), щоб не сплутати їх із менеджерськими.
+// ---------------------------------------------------------------------------
+const MANAGER_PAUSE_HOURS = Number(process.env.MANAGER_PAUSE_HOURS || 24);
+const botSentIgMids = new Set();
+const botSentIgTexts = new Map(); // clientId -> [нормалізовані тексти, надіслані ботом]
+const igManagerPause = new Map(); // clientId -> timestamp, до якого бот мовчить
+const normTxt = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 300);
+function rememberBotIgText(clientId, text) {
+  const arr = botSentIgTexts.get(clientId) || [];
+  arr.push(normTxt(text));
+  while (arr.length > 30) arr.shift();
+  botSentIgTexts.set(clientId, arr);
+}
+function isBotIgEcho(clientId, mid, text) {
+  if (mid && botSentIgMids.has(mid)) return true;
+  const t = normTxt(text);
+  return !!t && (botSentIgTexts.get(clientId) || []).includes(t);
+}
+function igPausedFor(clientId) {
+  const until = igManagerPause.get(clientId);
+  if (!until) return false;
+  if (Date.now() > until) { igManagerPause.delete(clientId); return false; }
+  return true;
+}
+
 async function sendInstagram(recipientId, text) {
   const token = process.env.INSTAGRAM_PAGE_ACCESS_TOKEN;
   if (!token) {
@@ -722,6 +751,7 @@ async function sendInstagram(recipientId, text) {
     rest = rest.slice(cut).trim();
   }
   for (const part of parts) {
+    rememberBotIgText(recipientId, part); // ДО відправки — echo може прийти раніше за відповідь API
     const r = await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -739,6 +769,10 @@ async function sendInstagram(recipientId, text) {
       );
       return;
     }
+    try {
+      const j = await r.json();
+      if (j && j.message_id) botSentIgMids.add(j.message_id);
+    } catch (e) {}
   }
 }
 
@@ -812,10 +846,28 @@ app.post("/webhook/instagram", async (req, res) => {
       .filter((a) => a && a.type === "image" && a.payload && a.payload.url)
       .map((a) => a.payload.url)
       .slice(0, 3);
-    // Instagram надсилає окремі "echo"-події на власні відправлені
-    // повідомлення бота — їх ігноруємо, інакше бот буде відповідати сам собі.
-    if (!senderId || messaging?.message?.is_echo) return;
+    if (!senderId) return;
+    // "echo" — повідомлення, надіслане ВІД нашого акаунта. Якщо його надіслав не бот,
+    // значить менеджер сам відповів клієнту → бот виходить з цього діалогу.
+    if (messaging?.message?.is_echo) {
+      const clientId = messaging?.recipient?.id;
+      if (clientId && !isBotIgEcho(clientId, messaging.message.mid, userText)) {
+        const already = igPausedFor(clientId);
+        igManagerPause.set(clientId, Date.now() + MANAGER_PAUSE_HOURS * 3600 * 1000);
+        if (userText) pushToHistory(`instagram:${clientId}`, "assistant", userText); // бот знатиме, що відповів менеджер
+        if (!already) {
+          console.log(`[instagram:${clientId}] менеджер відповів сам — бот мовчить ${MANAGER_PAUSE_HOURS} год`);
+        }
+      }
+      return;
+    }
     if (!userText && imageUrls.length === 0) return;
+    // Менеджер веде цей діалог — бот не відповідає, лише запам'ятовує повідомлення клієнта
+    if (igPausedFor(senderId)) {
+      if (userText) pushToHistory(`instagram:${senderId}`, "user", userText);
+      console.log(`[instagram:${senderId}] діалог веде менеджер — бот не відповідає`);
+      return;
+    }
 
     // Фото завантажуємо одразу (посилання Instagram тимчасові) і передаємо Claude так само, як у Telegram
     let contentForClaude = userText;
