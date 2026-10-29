@@ -74,6 +74,14 @@ const PROMPT_DETAILING = fs.readFileSync(
 // перезапуске сервера), но для старта этого достаточно.
 // ---------------------------------------------------------------------------
 const conversations = new Map();
+// Пауза відповідей бота в УСІХ каналах — Telegram, Instagram, чат на сайті
+// (команди адміна /pause, /resume або змінна BOT_PAUSED=true у Render)
+let tgPausedUntil = 0;
+function telegramPaused() {
+  if (["BOT_PAUSED", "TELEGRAM_PAUSED"].some((k) => String(process.env[k] || "").toLowerCase() === "true")) return true;
+  if (tgPausedUntil && Date.now() > tgPausedUntil) tgPausedUntil = 0;
+  return tgPausedUntil > 0;
+}
 const MAX_HISTORY_MESSAGES = 30; // сколько последних сообщений держим в контексте
 
 function getHistory(userId) {
@@ -578,14 +586,34 @@ app.post("/webhook/telegram", async (req, res) => {
     const chatId = message.chat.id;
 
     // Службові команди
-    const cmd = (message.text || "").trim().toLowerCase();
+    const cmd = (message.text || "").trim().toLowerCase().split(/\s+/)[0].replace(/@\w+$/, "");
     if (cmd === "/myid") {
       await sendTelegram(chatId, `Ваш chat ID: ${chatId}\nВставте його в Render → Environment як ADMIN_CHAT_ID.`);
+      return;
+    }
+    // Пауза відповідей у Telegram: /pause (або /pause 3 — на 3 години), /resume — увімкнути назад
+    if (ADMIN_CHAT_ID && String(chatId) === String(ADMIN_CHAT_ID) && ["/pause", "/resume"].includes(cmd)) {
+      if (cmd === "/pause") {
+        const hours = Number(String(message.text || "").trim().split(/\s+/)[1]) || 0;
+        tgPausedUntil = hours > 0 ? Date.now() + hours * 3600 * 1000 : Infinity;
+        await sendTelegram(chatId, hours > 0
+          ? `⏸ Бот не відповідає клієнтам ${hours} год (Telegram, Instagram, сайт). Увімкнути раніше: /resume`
+          : "⏸ Бот не відповідає клієнтам до команди /resume (Telegram, Instagram, чат на сайті).");
+      } else {
+        tgPausedUntil = 0;
+        await sendTelegram(chatId, "▶️ Бот знову відповідає клієнтам у всіх каналах.");
+      }
       return;
     }
     if (ADMIN_CHAT_ID && String(chatId) === String(ADMIN_CHAT_ID) && ["/status", "/report"].includes(cmd)) {
       if (cmd === "/status") await sendTelegram(chatId, formatHealth(await runHealthChecks()));
       if (cmd === "/report") await sendDailyReport(true);
+      return;
+    }
+    // Пауза: бот мовчить для клієнтів (адмін-команди вище працюють і під час паузи)
+    if (telegramPaused() && String(chatId) !== String(ADMIN_CHAT_ID)) {
+      console.log(`[telegram:${chatId}] пауза — бот не відповідає`);
+      if (message.text) pushToHistory(`telegram:${chatId}`, "user", message.text);
       return;
     }
     let contentForClaude;
@@ -667,6 +695,11 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const siteUserId = `site:${userId}`;
+    // Загальна пауза бота (/pause): консультант на сайті тимчасово не відповідає
+    if (telegramPaused()) {
+      pushToHistory(siteUserId, "user", String(message));
+      return res.json({ reply: "Зараз онлайн-консультант тимчасово недоступний. Зателефонуйте нам, будь ласка: +38 (067) 802-33-22 (Пн–Пт, 9:00–19:00)." });
+    }
     const replyText = await askClaude(siteUserId, message, "website");
 
     if (!leadAlreadySent.has(siteUserId)) {
@@ -862,6 +895,12 @@ app.post("/webhook/instagram", async (req, res) => {
       return;
     }
     if (!userText && imageUrls.length === 0) return;
+    // Загальна пауза бота (/pause) — не відповідаємо, лише запам'ятовуємо
+    if (telegramPaused()) {
+      if (userText) pushToHistory(`instagram:${senderId}`, "user", userText);
+      console.log(`[instagram:${senderId}] пауза — бот не відповідає`);
+      return;
+    }
     // Менеджер веде цей діалог — бот не відповідає, лише запам'ятовує повідомлення клієнта
     if (igPausedFor(senderId)) {
       if (userText) pushToHistory(`instagram:${senderId}`, "user", userText);
