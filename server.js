@@ -1439,6 +1439,14 @@ async function getAdCampaigns() {
   cachedCampaigns = { endpoint: list.length ? "orders" : null, list, tried, fields_seen: [...sampleKeys], samples };
   return cachedCampaigns;
 }
+// Перевірка: /api/fields?secret=ROAPP_DEBUG_SECRET — поля замовлення (марка/модель/рік), які бачить бот
+app.get("/api/fields", async (req, res) => {
+  if (!process.env.ROAPP_DEBUG_SECRET || req.query.secret !== process.env.ROAPP_DEBUG_SECRET) return res.sendStatus(403);
+  cachedCarFields = null;
+  const f = await getCarFieldIds();
+  res.json({ chosen: { brand: f.brand, model: f.model, year: f.year, yearType: f.yearType }, fields: f.list });
+});
+
 // Перевірка: /api/campaigns?secret=ROAPP_DEBUG_SECRET — які рекламні кампанії бачить бот
 app.get("/api/campaigns", async (req, res) => {
   if (!process.env.ROAPP_DEBUG_SECRET || req.query.secret !== process.env.ROAPP_DEBUG_SECRET) return res.sendStatus(403);
@@ -1542,7 +1550,10 @@ async function bookSlot(userId, input, source) {
   const customFields = {};
   customFields[cf.brand] = String(input.brand || "");
   customFields[cf.model] = String(input.model || "");
-  if (cf.year && input.year) customFields[cf.year] = String(input.year);
+  if (cf.year && input.year) {
+    const y = String(input.year).match(/\d{4}/) ? String(input.year).match(/\d{4}/)[0] : String(input.year);
+    customFields[cf.year] = /num|int|float|digit/i.test(cf.yearType || "") ? Number(y) : y;
+  }
   body.custom_fields = JSON.stringify(customFields);
 
   if (campaignId) body.ad_campaign_id = campaignId;
@@ -1598,6 +1609,19 @@ async function bookSlot(userId, input, source) {
 // який створює в RO App завдання-нагадування для менеджера.
 const MAKE_ORDER_WEBHOOK_URL = process.env.MAKE_ORDER_WEBHOOK_URL || "";
 async function sendOrderReminder(data) {
+  // Готові тексти для Завдання в Make — щоб нічого не склеювати формулами
+  data.task_title = [data.order_number, data.service].filter(Boolean).join(" · ");
+  data.task_description = [
+    `Клієнт: ${data.client_name || "—"}`,
+    `Телефон: ${data.client_phone || "—"}`,
+    data.contact_method ? `Зв'язатися: ${data.contact_method}` : null,
+    `Авто: ${data.car || "—"}`,
+    `Послуга: ${data.service || "—"}`,
+    `Дата: ${data.scheduled_for_text || "—"}`,
+    `Майстер: ${data.master || "—"}`,
+    `Джерело: ${{ instagram: "Instagram", telegram: "Telegram", website: "Сайт" }[data.source] || data.source || "—"}`,
+    data.order_number ? `Замовлення: ${data.order_number}` : null,
+  ].filter(Boolean).join("\n");
   if (!MAKE_ORDER_WEBHOOK_URL) {
     console.warn("MAKE_ORDER_WEBHOOK_URL не задано — нагадування менеджеру не відправлено:", data.order_number);
     return;
@@ -1677,14 +1701,21 @@ let cachedCarFields = null;
 async function getCarFieldIds() {
   if (cachedCarFields) return cachedCarFields;
   // Перевірено на реальному замовленні: f1492402 = Марка, f1492401 = Модель
-  const ids = { brand: "f1492402", model: "f1492401", year: null };
+  const ids = { brand: "f1492402", model: "f1492401", year: null, yearType: "", list: [] };
+  if (process.env.ROAPP_FIELD_YEAR) ids.year = String(process.env.ROAPP_FIELD_YEAR).replace(/^f?/, "f");
   try {
     const r = await roappGet("/orders/custom-fields");
     const list = listFrom(r.body);
     console.log("RO App поля замовлення:", JSON.stringify(list.map((f) => ({ id: f.id, name: f.name || f.title }))).slice(0, 800));
     const find = (re) => list.find((f) => re.test(String(f.name || f.title || "").toLowerCase()));
-    const y = find(/рік|год|year/);
-    if (y) ids.year = "f" + y.id; // марку/модель не перевизначаємо — ID вище перевірені
+    ids.list = list.map((f) => ({ id: f.id, name: f.name || f.title, type: f.type || f.field_type || "" }));
+    const y = list.find((f) => /рік|рiк|год вып|год$|year/i.test(String(f.name || f.title || "")));
+    if (y && !ids.year) ids.year = "f" + String(y.id).replace(/^f/, "");
+    if (y) ids.yearType = String(y.type || y.field_type || "");
+    if (!ids.year) {
+      console.warn("RO App: поле «Рік випуску» не знайдено. Поля:", JSON.stringify(ids.list).slice(0, 800));
+      alertAdmin("RO App: бот не знайшов поле «Рік випуску» в замовленні — рік не записується. Відкрийте /api/fields?secret=… і надішліть розробнику список полів (або задайте ROAPP_FIELD_YEAR у Render).", "year-field");
+    }
   } catch (e) {
     console.error("Не вдалося отримати поля замовлення:", e);
   }
