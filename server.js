@@ -343,6 +343,25 @@ async function askClaude(userId, content, source = "chat") {
   // Нові моделі Anthropic вимагають: розмова починається і ЗАКІНЧУЄТЬСЯ повідомленням клієнта (user),
   // ролі чергуються. Очищаємо копію, щоб жоден збій в історії не ламав відповідь.
   const messages = sanitizeMessages(getHistory(userId), content);
+  // Фото потрібні лише для цієї відповіді: в історії замінюємо їх на текстову позначку,
+  // щоб старі (або пошкоджені) фото не надсилались повторно і не ламали наступні відповіді
+  const stripImages = () => {
+    for (const m of getHistory(userId)) {
+      if (Array.isArray(m.content) && m.content.some((b) => b && b.type === "image")) {
+        const n = m.content.filter((b) => b && b.type === "image").length;
+        const txt = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n");
+        m.content = `[Клієнт надіслав фото (${n} шт.)] ${txt}`.trim();
+      }
+    }
+  };
+  try {
+    return await askClaudeInner(userId, systemPrompt, messages, tools, source);
+  } finally {
+    stripImages();
+  }
+}
+
+async function askClaudeInner(userId, systemPrompt, messages, tools, source) {
   let replyText = "";
 
   for (let step = 0; step < 5; step++) {
@@ -369,7 +388,7 @@ async function askClaude(userId, content, source = "chat") {
       console.error("Anthropic API error:", response.status, errText);
       logEvent("error", userId, `Anthropic API ${response.status}`);
       alertAdmin(`Anthropic API повернув помилку ${response.status}. Бот не може відповідати клієнтам!\n${errText.slice(0, 300)}`, "anthropic");
-      throw new Error(`Anthropic API вернул ошибку ${response.status}`);
+      throw new Error(`Anthropic API вернул ошибку ${response.status}: ${(() => { try { return JSON.parse(errText).error.message; } catch (e) { return errText.slice(0, 200); } })()}`);
     }
 
     const data = await response.json();
@@ -558,11 +577,10 @@ async function downloadTelegramPhotoAsBase64(fileId) {
   const fileResp = await fetch(
     `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
   );
-  const arrayBuffer = await fileResp.arrayBuffer();
-  const base64Data = Buffer.from(arrayBuffer).toString("base64");
-
-  // Telegram обычно присылает фото в формате jpeg
-  const mediaType = filePath.endsWith(".png") ? "image/png" : "image/jpeg";
+  const buf = Buffer.from(await fileResp.arrayBuffer());
+  const base64Data = buf.toString("base64");
+  // Формат визначаємо за вмістом файлу (не за розширенням)
+  const mediaType = detectImageType(buf) || (filePath.endsWith(".png") ? "image/png" : "image/jpeg");
 
   return { base64Data, mediaType };
 }
@@ -773,6 +791,16 @@ function igPausedFor(clientId) {
   return true;
 }
 
+// Справжній формат фото за першими байтами (заголовок сервера буває неправильним)
+function detectImageType(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf.slice(0, 3).toString() === "GIF") return "image/gif";
+  if (buf.slice(0, 4).toString() === "RIFF" && buf.slice(8, 12).toString() === "WEBP") return "image/webp";
+  return null;
+}
+
 async function sendInstagram(recipientId, text) {
   const token = process.env.INSTAGRAM_PAGE_ACCESS_TOKEN;
   if (!token) {
@@ -921,10 +949,11 @@ app.post("/webhook/instagram", async (req, res) => {
         try {
           const r = await fetch(url);
           if (!r.ok) continue;
-          const type = (r.headers.get("content-type") || "image/jpeg").split(";")[0];
-          const mediaType = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(type) ? type : "image/jpeg";
-          const data = Buffer.from(await r.arrayBuffer()).toString("base64");
-          images.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+          const buf = Buffer.from(await r.arrayBuffer());
+          const mediaType = detectImageType(buf);
+          if (!mediaType) { console.warn("Instagram: вкладення не є фото (формат не підтримується)"); continue; }
+          if (buf.length > 4.5 * 1024 * 1024) { console.warn("Instagram: фото завелике для аналізу:", buf.length); continue; }
+          images.push({ type: "image", source: { type: "base64", media_type: mediaType, data: buf.toString("base64") } });
         } catch (e) {
           console.warn("Instagram: не вдалося завантажити фото:", e);
         }
