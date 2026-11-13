@@ -73,6 +73,28 @@ const PROMPT_DETAILING = fs.readFileSync(
 // Для продакшена лучше заменить на Redis/базу данных (история пропадёт при
 // перезапуске сервера), но для старта этого достаточно.
 // ---------------------------------------------------------------------------
+
+// Запит до Anthropic API з повторними спробами: тимчасові збої (429, 5xx, 529 «перевантажено»,
+// 503 «credential validation failed», обрив мережі) повторюємо до 3 разів, щоб клієнт не лишився без відповіді.
+async function anthropicFetch(options) {
+  const delays = [0, 1500, 4000];
+  let last;
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/messages", options);
+      if (![429, 500, 502, 503, 504, 529].includes(r.status)) return r;
+      last = r;
+      console.warn(`Anthropic API тимчасова помилка ${r.status} — спроба ${i + 1}/${delays.length}`);
+    } catch (e) {
+      last = e;
+      console.warn(`Anthropic API недоступний (${e}) — спроба ${i + 1}/${delays.length}`);
+    }
+  }
+  if (last instanceof Error) throw last;
+  return last;
+}
+
 const conversations = new Map();
 // Пауза відповідей бота в УСІХ каналах — Telegram, Instagram, чат на сайті
 // (команди адміна /pause, /resume або змінна BOT_PAUSED=true у Render)
@@ -220,7 +242,7 @@ async function classifyTopic(userId, latestUserText) {
     .join("\n");
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await anthropicFetch({
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -373,7 +395,7 @@ async function askClaudeInner(userId, systemPrompt, messages, tools, source) {
     };
     if (tools) requestBody.tools = tools;
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await anthropicFetch({
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -433,7 +455,7 @@ async function extractLeadFromConversation(userId) {
     .join("\n");
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await anthropicFetch({
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1887,7 +1909,7 @@ async function runHealthChecks() {
 
   // 2. Anthropic API (мінімальний запит)
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const r = await anthropicFetch({
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model: CLASSIFIER_MODEL, max_tokens: 5, messages: [{ role: "user", content: "ok" }] }),
@@ -2005,7 +2027,7 @@ async function reviewDialogsWithAI(transcripts) {
   if (!transcripts.length) return "Діалогів сьогодні не було.";
   const text = transcripts.join("\n\n=====\n\n").slice(0, 60000);
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const r = await anthropicFetch({
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
