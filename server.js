@@ -357,6 +357,10 @@ async function askClaude(userId, content, source = "chat") {
       timeZone: "Europe/Kyiv", weekday: "long", day: "numeric", month: "long", year: "numeric",
     });
     systemPrompt += `\n\n## Онлайн-запис увімкнено\nСьогодні: ${today}. Для запису використовуй інструменти find_free_slots і book_slot. Ніколи не вигадуй дати чи час — пропонуй лише ті вікна, які повернув find_free_slots.`;
+    const done = typeof completedBookings !== "undefined" && completedBookings.get(userId);
+    if (done) {
+      systemPrompt += `\n\n## ⚠️ Клієнт УЖЕ записаний\nУ цьому діалозі клієнта вже записано: ${done.service}, ${done.day}${done.order_number ? ", замовлення " + done.order_number : ""}. Запис дійсний. НЕ викликай повторно book_slot для цієї ж послуги, НЕ кажи, що вільних вікон немає, і не скасовуй запис. Якщо клієнт хоче перенести або скасувати — скажи, що менеджер зв'яжеться і все змінить.`;
+    }
   } else {
     systemPrompt += "\n\n## Онлайн-запис вимкнено\nНе пропонуй обрати дату й час у чаті — лише зворотний дзвінок менеджера.";
   }
@@ -1410,7 +1414,7 @@ async function findFreeSlots(userId, serviceKey, maxResults = 4) {
     }
   }
   offeredSlots.set(userId, cache);
-  if (result.length === 0) return { service: svc.title, slots: [], note: "Вільних вікон найближчим часом немає — запропонуй зворотний дзвінок менеджера." };
+  if (result.length === 0) return { service: svc.title, slots: [], note: "Вільних вікон найближчим часом немає — запропонуй зворотний дзвінок менеджера. АЛЕ якщо раніше в цьому діалозі клієнта вже записано (ти підтвердив дату/номер замовлення) — НЕ кажи про відсутність вікон, а підтвердь існуючий запис." };
   return { service: svc.title, slots: result };
 }
 
@@ -1534,10 +1538,26 @@ async function campaignIdForSource(source) {
   return Number(found.id);
 }
 
+// Записи, вже створені ботом у цьому діалозі (userId -> {order_number, day, service, serviceKey})
+const completedBookings = new Map();
+
 async function bookSlot(userId, input, source) {
+  // Захист від повторного запису: якщо клієнт уже записаний — не створюємо нове замовлення
+  // і не перевіряємо «зайнятість» (день зайнятий саме його замовленням).
+  const done = completedBookings.get(userId);
+  if (done) {
+    return {
+      ok: true,
+      already_booked: true,
+      day: done.day,
+      service: done.service,
+      order_number: done.order_number,
+      note: "Клієнт УЖЕ записаний (див. day/order_number). НЕ створюй новий запис і НЕ кажи, що вільних вікон немає. Просто підтвердь існуючий запис. Якщо клієнт хоче перенести дату — запропонуй, щоб менеджер передзвонив і переніс запис.",
+    };
+  }
   const cache = offeredSlots.get(userId) || {};
   const slot = cache[input.slot_id];
-  if (!slot) return { ok: false, error: "Слот не знайдено — спочатку виклич find_free_slots і запропонуй вікна клієнту." };
+  if (!slot) return { ok: false, error: "Слот не знайдено. Якщо раніше в цьому діалозі ти вже підтвердив клієнту запис (з датою/номером замовлення) — запис ДІЙСНИЙ, повторно не записуй і просто підтвердь його. Інакше — спочатку виклич find_free_slots і запропонуй вікна клієнту." };
   if (!input.name || !input.phone) return { ok: false, error: "Потрібні ім'я і телефон клієнта." };
   if (!isValidPhone(input.phone)) return { ok: false, error: "Номер телефону некоректний. Запис ще НЕ створено. Попроси клієнта перевірити номер і написати його повністю (наприклад, 067 123 45 67), потім знову виклич book_slot." };
   if (!input.brand || !input.model || !input.year) return { ok: false, error: "Потрібні марка, модель і рік випуску авто — запитай у клієнта." };
@@ -1653,6 +1673,7 @@ async function bookSlot(userId, input, source) {
     source,
   });
 
+  completedBookings.set(userId, { order_number: order.number || "", day: dayLabel(start), service: svc.title, serviceKey: slot.serviceKey });
   return { ok: true, day: dayLabel(start), service: svc.title, order_number: order.number || "" };
 }
 
@@ -1842,7 +1863,17 @@ const BOOKING_TOOLS = [
 
 async function runBookingTool(userId, name, input, source) {
   try {
-    if (name === "find_free_slots") return await findFreeSlots(userId, input.service);
+    if (name === "find_free_slots") {
+      const done = completedBookings.get(userId);
+      if (done) {
+        return {
+          already_booked: true,
+          booking: done,
+          note: "Клієнт УЖЕ записаний у цьому діалозі. Не шукай нові вікна і НЕ кажи, що вільних вікон немає. Нагадай клієнту про його запис. Якщо він хоче перенести дату або записатися ще на іншу послугу — запропонуй, щоб менеджер передзвонив і все узгодив.",
+        };
+      }
+      return await findFreeSlots(userId, input.service);
+    }
     if (name === "book_slot") return await bookSlot(userId, input, source);
     return { error: "Невідомий інструмент" };
   } catch (err) {
