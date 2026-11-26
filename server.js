@@ -878,7 +878,8 @@ async function sendInstagram(recipientId, text) {
 const igHistoryLoaded = new Set();
 const REPEAT_LEAD_DAYS = Number(process.env.REPEAT_LEAD_DAYS || 3);
 const igReturningClients = new Map(); // userId -> дата попередньої переписки
-async function loadInstagramHistory(senderId, currentMid) {
+async function loadInstagramHistory(senderId, currentMids) {
+  const skipMids = new Set([].concat(currentMids || []).filter(Boolean));
   const userId = `instagram:${senderId}`;
   if (igHistoryLoaded.has(userId)) return;
   igHistoryLoaded.add(userId);
@@ -896,7 +897,7 @@ async function loadInstagramHistory(senderId, currentMid) {
       return;
     }
     const msgs = (j.data?.[0]?.messages?.data || [])
-      .filter((m) => m.id !== currentMid && m.message && m.message.trim())
+      .filter((m) => !skipMids.has(m.id) && m.message && m.message.trim())
       .reverse(); // API віддає від нових до старих
     let count = 0;
     for (const m of msgs) {
@@ -994,26 +995,71 @@ app.post("/webhook/instagram", async (req, res) => {
       }
     }
 
-    const instagramUserId = `instagram:${senderId}`;
-    await loadInstagramHistory(senderId, messaging?.message?.mid);
-    const replyText = await askClaude(instagramUserId, contentForClaude, "instagram");
-
-    if (!leadAlreadySent.has(instagramUserId)) {
-      const lead = await extractLeadFromConversation(instagramUserId);
-      if (lead && isValidPhone(lead.phone)) {
-        if (igReturningClients.has(instagramUserId)) {
-          lead.topic = `🔁 ПОВТОРНЕ ЗВЕРНЕННЯ (клієнт уже писав в Instagram ${igReturningClients.get(instagramUserId)}). ${lead.topic || ""}`;
-        }
-        handleLead(instagramUserId, lead, "instagram");
-      }
-    }
-
-    await sendInstagram(senderId, replyText);
+    // Клієнти часто пишуть кількома повідомленнями підряд («Вітаю» / «Скільки коштує…» / «Audi Q5 2015»).
+    // Чекаємо кілька секунд і відповідаємо ОДИН раз на всі повідомлення разом.
+    enqueueIg(senderId, contentForClaude, messaging?.message?.mid);
   } catch (err) {
     console.error("Ошибка обработки Instagram сообщения:", err);
     alertAdmin(`Помилка обробки повідомлення в Instagram: ${err}`, "ig-error");
   }
 });
+
+// ---------- Об'єднання кількох повідомлень клієнта в одне (Instagram) ----------
+const IG_DEBOUNCE_MS = Number(process.env.IG_DEBOUNCE_MS || 6000);
+const igQueues = new Map(); // senderId -> { items: [], mids: [], timer, busy }
+function enqueueIg(senderId, content, mid) {
+  const q = igQueues.get(senderId) || { items: [], mids: [], timer: null, busy: false };
+  q.items.push(content);
+  if (mid) q.mids.push(mid);
+  clearTimeout(q.timer);
+  q.timer = setTimeout(() => flushIg(senderId), IG_DEBOUNCE_MS);
+  igQueues.set(senderId, q);
+}
+function combineContents(items) {
+  if (items.every((c) => typeof c === "string")) return items.join("\n");
+  const images = [];
+  const texts = [];
+  for (const c of items) {
+    if (typeof c === "string") texts.push(c);
+    else for (const b of c) (b.type === "image" ? images : texts).push(b.type === "image" ? b : b.text);
+  }
+  return [...images, { type: "text", text: texts.filter(Boolean).join("\n") || "Клієнт надіслав фото." }];
+}
+async function flushIg(senderId) {
+  const q = igQueues.get(senderId);
+  if (!q || !q.items.length) return;
+  if (q.busy) { q.timer = setTimeout(() => flushIg(senderId), 1500); return; } // ще відповідаємо на попередні
+  const items = q.items.splice(0);
+  const mids = q.mids.splice(0);
+  q.busy = true;
+  try {
+    await processInstagramMessage(senderId, combineContents(items), mids);
+  } catch (err) {
+    console.error("Ошибка обработки Instagram сообщения:", err);
+    alertAdmin(`Помилка обробки повідомлення в Instagram: ${err}`, "ig-error");
+  } finally {
+    q.busy = false;
+    if (!q.items.length) igQueues.delete(senderId);
+  }
+}
+async function processInstagramMessage(senderId, contentForClaude, mids) {
+  const instagramUserId = `instagram:${senderId}`;
+  await loadInstagramHistory(senderId, mids);
+  if (igPausedFor(senderId)) return; // поки чекали — відповів менеджер
+  const replyText = await askClaude(instagramUserId, contentForClaude, "instagram");
+
+  if (!leadAlreadySent.has(instagramUserId)) {
+    const lead = await extractLeadFromConversation(instagramUserId);
+    if (lead && isValidPhone(lead.phone)) {
+      if (igReturningClients.has(instagramUserId)) {
+        lead.topic = `🔁 ПОВТОРНЕ ЗВЕРНЕННЯ (клієнт уже писав в Instagram ${igReturningClients.get(instagramUserId)}). ${lead.topic || ""}`;
+      }
+      handleLead(instagramUserId, lead, "instagram");
+    }
+  }
+
+  await sendInstagram(senderId, replyText);
+}
 
 // ---------------------------------------------------------------------------
 // RO APP (RemOnline) API v2 — діагностика перед підключенням онлайн-запису.
